@@ -233,7 +233,7 @@ cli/geneminer2 stats \
 | `-f FILE` | 样本表，必需 |
 | `-r DIR` | 参考序列目录，必需 |
 | `-o DIR` | 输出目录，必需 |
-| `-p INT` | 并行进程总数，默认 `1` |
+| `-p INT\|auto` | 共享 CPU 预算，默认 `auto`。自动模式统计 affinity/cpuset 允许的物理核心，并受 cgroup 或作业调度器上限约束；整数值可覆盖自动检测。 |
 
 ### 7.2 Reads 过滤与 re-filtering
 

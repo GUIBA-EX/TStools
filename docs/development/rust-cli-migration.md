@@ -7,7 +7,7 @@ runtime. The former Python implementation has been removed; release execution ha
 | --- | --- | --- | --- |
 | `filter` / `refilter` / `assemble` original | `MainFilterNew`, `main_refilter_new`, `main_assembler-original-rust` | partial (native standalone + gene route) | paired/single-end recovery and generic original-workflow fixtures |
 | UCE recovery | `uce_filter`, `main_assembler-rust`, `gm2_tools` | partial (paired native and legacy-candidate paths) | paired native/legacy fixtures; single-end and shadow failure fixtures remain |
-| UCE rescue | UCE recovery backends | partial (whole-contig + terminal-only rounds) | two-round terminal-bait and accepted-locus rollback fixture; per-end read-evidence reconciliation remains |
+| UCE rescue | UCE recovery backends | partial (whole-contig + terminal-only rounds with per-end read-evidence reconciliation) | broader biological fixtures and end-to-end parity fixtures remain |
 | `mito` | `mito_workflow`, UCE tools | partial (native full skeleton) | bait collapse, text refilter, seed rescue and circular adaptive-stop fixture; biological circular/linear fixtures pending |
 | `rad`, `rad-probe`, `rad-validate` | `rad_workflow`, optional ipyrad, MainFilter, refilter, original-rust | native route | synthetic `.loci`, inferred ipyrad output, strict/phylogeny arm matrix, partial-arm and CLI-dispatch fixtures |
 | `gene` | `gene_workflow`, original-rust tools | partial | single/paired recovery and cohort fixtures |

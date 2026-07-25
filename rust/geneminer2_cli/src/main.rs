@@ -3,6 +3,7 @@
 //! The public CLI is implemented in Rust and does not require a Python runtime.
 
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Read};
@@ -14,6 +15,13 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Instant;
+
+const UCE_RESCUE_ASSEMBLY_KMER: &str = "21";
+const UCE_TERMINAL_MIN_EXTENSION: usize = 30;
+const UCE_TERMINAL_MIN_BREADTH: f64 = 0.85;
+const UCE_TERMINAL_MAX_GAP: usize = 30;
+const UCE_TERMINAL_MIN_FRAGMENTS: usize = 2;
+const UCE_TERMINAL_MIN_BRIDGES: usize = 1;
 
 const COMMANDS: &[&str] = &[
     "filter",
@@ -244,6 +252,7 @@ struct Options {
     output: String,
     assembly_mode: String,
     workers: usize,
+    worker_source: String,
     kf: String,
     step: String,
     ka: String,
@@ -296,6 +305,19 @@ fn value(args: &[String], names: &[&str], default: &str) -> Result<String, Strin
         }
     }
     Ok(default.to_owned())
+}
+
+fn resolve_worker_budget(request: &str) -> Result<(usize, String), String> {
+    if request == "auto" {
+        return Ok(auto_worker_budget());
+    }
+    let workers = request
+        .parse::<usize>()
+        .map_err(|_| "-p must be 'auto' or a positive integer")?;
+    if workers == 0 {
+        return Err("-p must be at least 1".into());
+    }
+    Ok((workers, format!("explicit -p {workers}")))
 }
 
 fn flag(args: &[String], name: &str) -> Result<bool, String> {
@@ -357,6 +379,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
     if !matches!(log_format.as_str(), "text" | "json") {
         return Err("--log-format must be text or json".into());
     }
+    let (workers, worker_source) = resolve_worker_budget(&value(args, &["-p"], "auto")?)?;
     if commands == ["gene"] {
         commands = vec![
             "filter".into(),
@@ -403,9 +426,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         samples: value(args, &["-f"], "")?,
         output: value(args, &["-o"], "")?,
         assembly_mode,
-        workers: value(args, &["-p"], "1")?
-            .parse()
-            .map_err(|_| "-p must be a positive integer")?,
+        workers,
+        worker_source,
         kf: value(args, &["-kf"], "31")?,
         step: value(args, &["-s", "--step-size"], "4")?,
         ka: value(args, &["-ka"], "0")?,
@@ -758,6 +780,18 @@ fn uce_assembler_args(
     ])
 }
 
+fn uce_rescue_assembler_args(
+    opt: &Options,
+    sample_dir: &Path,
+    reference: &Path,
+    threads: usize,
+) -> Result<Vec<String>, String> {
+    let mut rescue_opt = opt.clone();
+    rescue_opt.reference = reference.display().to_string();
+    rescue_opt.ka = UCE_RESCUE_ASSEMBLY_KMER.into();
+    uce_assembler_args(&rescue_opt, sample_dir, threads)
+}
+
 fn build_uce_rescue_reference(
     reference: &Path,
     sample: &Path,
@@ -768,12 +802,21 @@ fn build_uce_rescue_reference(
     if rescue.exists() {
         fs::remove_dir_all(rescue).map_err(|e| e.to_string())?;
     }
-    copy_tree(reference, rescue)?;
+    if active.is_some() {
+        fs::create_dir_all(rescue).map_err(|e| e.to_string())?;
+    } else {
+        copy_tree(reference, rescue)?;
+    }
     let summary = read_uce_summary(&sample.join("uce_assembly_summary.csv"))?;
     let mut added = 0;
     for (locus, source) in reference_loci(reference)? {
         if active.is_some_and(|loci| !loci.contains(&locus)) {
             continue;
+        }
+        let file_name = source.file_name().ok_or("invalid UCE reference filename")?;
+        let rescue_path = rescue.join(file_name);
+        if active.is_some() {
+            fs::copy(&source, &rescue_path).map_err(|e| e.to_string())?;
         }
         if !uce_row_accepted(summary.rows.get(&locus)) {
             continue;
@@ -784,7 +827,7 @@ fn build_uce_rescue_reference(
         }
         let mut target = fs::OpenOptions::new()
             .append(true)
-            .open(rescue.join(source.file_name().ok_or("invalid UCE reference filename")?))
+            .open(rescue_path)
             .map_err(|e| e.to_string())?;
         use std::io::Write;
         for (index, (_, sequence)) in fasta_records(&contig)?.into_iter().enumerate() {
@@ -840,18 +883,452 @@ fn build_uce_terminal_baits(
     Ok(written)
 }
 
+fn restore_locus_file(
+    sample: &Path,
+    backup: &Path,
+    directory: &str,
+    locus: &str,
+) -> Result<(), String> {
+    let original = backup.join(directory).join(format!("{locus}.fasta"));
+    let current = sample.join(directory).join(format!("{locus}.fasta"));
+    if current.exists() {
+        fs::remove_file(&current).map_err(|e| e.to_string())?;
+    }
+    if original.is_file() {
+        if let Some(parent) = current.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        fs::copy(original, current).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn locus_file_name_matches(name: &str, locus: &str, paired: bool) -> bool {
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if paired {
+        stem == format!("{locus}_1") || stem == format!("{locus}_2")
+    } else {
+        stem == locus
+    }
+}
+
+fn restore_locus_directory_files(
+    sample: &Path,
+    backup: &Path,
+    directory: &str,
+    locus: &str,
+) -> Result<(), String> {
+    let source_dir = backup.join(directory);
+    let destination_dir = sample.join(directory);
+    let mut names = std::collections::BTreeSet::new();
+    for root in [&source_dir, &destination_dir] {
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(root).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            if entry.path().is_file() {
+                names.insert(entry.file_name());
+            }
+        }
+    }
+    for name in names {
+        let text = name.to_string_lossy();
+        if !locus_file_name_matches(&text, locus, directory == "filtered_pe") {
+            continue;
+        }
+        let source = source_dir.join(&name);
+        let destination = destination_dir.join(&name);
+        if destination.exists() {
+            fs::remove_file(&destination).map_err(|e| e.to_string())?;
+        }
+        if source.is_file() {
+            fs::create_dir_all(&destination_dir).map_err(|e| e.to_string())?;
+            fs::copy(source, destination).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn count_rows(path: &Path) -> Result<Vec<String>, String> {
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    Ok(fs::read_to_string(path)
+        .map_err(|e| e.to_string())?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+fn restore_locus_read_count(sample: &Path, backup: &Path, locus: &str) -> Result<(), String> {
+    let filename = "ref_reads_count_dict.txt";
+    let source = backup.join(filename);
+    let destination = sample.join(filename);
+    let backup_rows = count_rows(&source)?;
+    let current_rows = count_rows(&destination)?;
+    let mut merged = current_rows
+        .into_iter()
+        .filter(|line| line.split(',').next() != Some(locus))
+        .collect::<Vec<_>>();
+    merged.extend(
+        backup_rows
+            .into_iter()
+            .filter(|line| line.split(',').next() == Some(locus)),
+    );
+    if merged.is_empty() {
+        if destination.exists() {
+            fs::remove_file(destination).map_err(|e| e.to_string())?;
+        }
+    } else {
+        fs::write(destination, format!("{}\n", merged.join("\n"))).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn write_result_dict_from_uce_summary(sample: &Path, summary: &UceSummary) -> Result<(), String> {
+    let mut text = String::new();
+    for (locus, row) in &summary.rows {
+        if row.get("status").is_some_and(|status| status == "skipped") {
+            continue;
+        }
+        text.push_str(&format!(
+            "{},{},{},\n",
+            locus,
+            row.get("status").map(String::as_str).unwrap_or_default(),
+            row.get("read_count")
+                .map(String::as_str)
+                .unwrap_or_default()
+        ));
+    }
+    fs::write(sample.join("result_dict.txt"), text).map_err(|e| e.to_string())
+}
+
 fn restore_rescue_locus(sample: &Path, backup: &Path, locus: &str) -> Result<(), String> {
     for directory in ["results", "contigs_all", "contigs_all_low"] {
-        let original = backup.join(directory).join(format!("{locus}.fasta"));
-        let current = sample.join(directory).join(format!("{locus}.fasta"));
-        if current.exists() {
-            fs::remove_file(&current).map_err(|e| e.to_string())?;
+        restore_locus_file(sample, backup, directory, locus)?;
+    }
+    for directory in ["filtered", "filtered_pe"] {
+        restore_locus_directory_files(sample, backup, directory, locus)?;
+    }
+    restore_locus_read_count(sample, backup, locus)
+}
+
+#[derive(Clone, Debug, Default)]
+struct TerminalSideEvidence {
+    length: usize,
+    breadth: f64,
+    max_gap: usize,
+    fragments: usize,
+    bridges: usize,
+    accepted: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TerminalEvidence {
+    left: TerminalSideEvidence,
+    right: TerminalSideEvidence,
+}
+
+#[derive(Default)]
+struct RescueReportContext {
+    round_statuses: std::collections::BTreeMap<(usize, String), String>,
+    terminal_audits: std::collections::BTreeMap<(usize, String), TerminalEvidence>,
+    status_by_locus: std::collections::BTreeMap<String, String>,
+    overall_status: String,
+}
+
+struct RescueRoundOutcome {
+    after: UceSummary,
+    statuses: std::collections::BTreeMap<String, String>,
+    evidence_by_locus: std::collections::BTreeMap<String, TerminalEvidence>,
+}
+
+fn reverse_complement_text(sequence: &str) -> String {
+    sequence
+        .bytes()
+        .rev()
+        .map(|base| match base.to_ascii_uppercase() {
+            b'A' => 'T',
+            b'C' => 'G',
+            b'G' => 'C',
+            b'T' => 'A',
+            _ => 'N',
+        })
+        .collect()
+}
+
+fn read_locus_fastq(sample: &Path, locus: &str) -> Result<Vec<(String, String)>, String> {
+    let path = sample.join("filtered").join(format!("{locus}.fq"));
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut reads = Vec::new();
+    for record in lines.chunks_exact(4) {
+        let title = record[0]
+            .trim_start_matches('@')
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        let fragment = title
+            .rsplit_once('/')
+            .map_or(title, |(prefix, _)| prefix)
+            .to_owned();
+        reads.push((fragment, record[1].trim().to_ascii_uppercase()));
+    }
+    Ok(reads)
+}
+
+fn maximum_false_run(values: &[bool]) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+    for value in values {
+        if *value {
+            current = 0;
+        } else {
+            current += 1;
+            longest = longest.max(current);
         }
-        if original.is_file() {
-            if let Some(parent) = current.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    longest
+}
+
+fn terminal_support_metrics(
+    sequence: &str,
+    old_start: usize,
+    old_end: usize,
+    reads: &[(String, String)],
+) -> (
+    TerminalSideEvidence,
+    TerminalSideEvidence,
+    Vec<bool>,
+    std::collections::HashMap<String, u8>,
+) {
+    const LEFT_EXTENSION: u8 = 1;
+    const RIGHT_EXTENSION: u8 = 2;
+    const LEFT_CORE: u8 = 4;
+    const RIGHT_CORE: u8 = 8;
+    const KMER_SIZE: usize = 21;
+
+    let bytes = sequence.as_bytes();
+    let mut covered = vec![false; bytes.len()];
+    let left_core_end = old_end.min(old_start.saturating_add(150));
+    let right_core_start = old_start.max(old_end.saturating_sub(150));
+    let mut positions: std::collections::HashMap<Vec<u8>, Vec<usize>> =
+        std::collections::HashMap::new();
+    if bytes.len() >= KMER_SIZE {
+        for start in 0..=bytes.len() - KMER_SIZE {
+            let kmer = &bytes[start..start + KMER_SIZE];
+            if kmer
+                .iter()
+                .all(|base| matches!(base.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T'))
+            {
+                positions
+                    .entry(kmer.iter().map(u8::to_ascii_uppercase).collect())
+                    .or_default()
+                    .push(start);
             }
-            fs::copy(original, current).map_err(|e| e.to_string())?;
+        }
+    }
+
+    let mut fragment_regions = std::collections::HashMap::<String, u8>::new();
+    for (fragment, read) in reads {
+        fragment_regions.entry(fragment.clone()).or_default();
+        let mut observed = std::collections::HashSet::<Vec<u8>>::new();
+        for oriented in [read.clone(), reverse_complement_text(read)] {
+            let oriented = oriented.as_bytes();
+            if oriented.len() < KMER_SIZE {
+                continue;
+            }
+            for offset in 0..=oriented.len() - KMER_SIZE {
+                observed.insert(oriented[offset..offset + KMER_SIZE].to_vec());
+            }
+        }
+        for kmer in observed {
+            for start in positions.get(&kmer).into_iter().flatten().copied() {
+                let end = start + KMER_SIZE;
+                covered[start..end].fill(true);
+                let regions = fragment_regions.entry(fragment.clone()).or_default();
+                if start < old_start {
+                    *regions |= LEFT_EXTENSION;
+                }
+                if end > old_end {
+                    *regions |= RIGHT_EXTENSION;
+                }
+                if end > old_start && start < left_core_end {
+                    *regions |= LEFT_CORE;
+                }
+                if end > right_core_start && start < old_end {
+                    *regions |= RIGHT_CORE;
+                }
+            }
+        }
+    }
+
+    let side = |start: usize, end: usize, extension: u8, core: u8| {
+        let length = end.saturating_sub(start);
+        if length == 0 {
+            return TerminalSideEvidence {
+                breadth: 1.0,
+                ..TerminalSideEvidence::default()
+            };
+        }
+        let side_coverage = &covered[start..end];
+        let fragments = fragment_regions
+            .values()
+            .filter(|regions| **regions & extension != 0)
+            .count();
+        let bridges = fragment_regions
+            .values()
+            .filter(|regions| **regions & extension != 0 && **regions & core != 0)
+            .count();
+        let breadth = side_coverage.iter().filter(|value| **value).count() as f64 / length as f64;
+        let max_gap = maximum_false_run(side_coverage);
+        TerminalSideEvidence {
+            length,
+            breadth,
+            max_gap,
+            fragments,
+            bridges,
+            accepted: length >= UCE_TERMINAL_MIN_EXTENSION
+                && breadth >= UCE_TERMINAL_MIN_BREADTH
+                && max_gap <= UCE_TERMINAL_MAX_GAP
+                && fragments >= UCE_TERMINAL_MIN_FRAGMENTS
+                && bridges >= UCE_TERMINAL_MIN_BRIDGES,
+        }
+    };
+    (
+        side(0, old_start, LEFT_EXTENSION, LEFT_CORE),
+        side(old_end, bytes.len(), RIGHT_EXTENSION, RIGHT_CORE),
+        covered,
+        fragment_regions,
+    )
+}
+
+fn write_trimmed_locus_sequence(sample: &Path, locus: &str, sequence: &str) -> Result<(), String> {
+    let path = sample.join("results").join(format!("{locus}.fasta"));
+    if !path.is_file() {
+        return Ok(());
+    }
+    let title = fasta_records(&path)?
+        .into_iter()
+        .next()
+        .map(|record| record.0)
+        .unwrap_or_else(|| locus.to_owned());
+    fs::write(path, format!(">{title}\n{sequence}\n")).map_err(|e| e.to_string())
+}
+
+fn terminal_reconcile_locus(
+    sample: &Path,
+    backup: &Path,
+    locus: &str,
+    after_row: &mut std::collections::BTreeMap<String, String>,
+) -> Result<(Option<TerminalEvidence>, String), String> {
+    let Some(old_sequence) =
+        first_fasta_sequence(&backup.join("results").join(format!("{locus}.fasta")))?
+    else {
+        return Ok((None, "missing_contig".into()));
+    };
+    let Some(mut new_sequence) =
+        first_fasta_sequence(&sample.join("results").join(format!("{locus}.fasta")))?
+    else {
+        return Ok((None, "missing_contig".into()));
+    };
+    let old_start = if let Some(position) = new_sequence.find(&old_sequence) {
+        position
+    } else {
+        let reverse = reverse_complement_text(&new_sequence);
+        let Some(position) = reverse.find(&old_sequence) else {
+            return Ok((None, "core_changed".into()));
+        };
+        new_sequence = reverse;
+        position
+    };
+    let old_end = old_start + old_sequence.len();
+    let reads = read_locus_fastq(sample, locus)?;
+    let (left, right, covered, fragment_regions) =
+        terminal_support_metrics(&new_sequence, old_start, old_end, &reads);
+    let kept_left = if left.accepted {
+        &new_sequence[..old_start]
+    } else {
+        ""
+    };
+    let kept_right = if right.accepted {
+        &new_sequence[old_end..]
+    } else {
+        ""
+    };
+    let accepted_sequence = format!("{kept_left}{old_sequence}{kept_right}");
+    let evidence = TerminalEvidence { left, right };
+    if accepted_sequence == old_sequence {
+        return Ok((Some(evidence), "no_supported_extension".into()));
+    }
+
+    write_trimmed_locus_sequence(sample, locus, &accepted_sequence)?;
+    let accepted_start = if evidence.left.accepted { 0 } else { old_start };
+    let accepted_end = if evidence.right.accepted {
+        new_sequence.len()
+    } else {
+        old_end
+    };
+    let accepted_coverage = &covered[accepted_start..accepted_end];
+    let supported = accepted_coverage.iter().filter(|value| **value).count();
+    let supported_positions = accepted_coverage
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| value.then_some(index))
+        .collect::<Vec<_>>();
+    let supported_span = supported_positions
+        .first()
+        .zip(supported_positions.last())
+        .map_or(0, |(first, last)| last - first + 1);
+    let fragments = fragment_regions
+        .values()
+        .filter(|regions| **regions != 0)
+        .count();
+    let length = accepted_sequence.len();
+    after_row.insert("selected_contig_length".into(), length.to_string());
+    after_row.insert("read_supported_span".into(), supported_span.to_string());
+    after_row.insert("slice_supported_bases".into(), supported.to_string());
+    after_row.insert(
+        "slice_support_breadth".into(),
+        format!("{:.6}", supported as f64 / length as f64),
+    );
+    after_row.insert(
+        "max_slice_support_gap".into(),
+        maximum_false_run(accepted_coverage).to_string(),
+    );
+    after_row.insert("read_count".into(), fragments.to_string());
+    if let Some(unique) = uce_number(Some(after_row), "unique_read_count") {
+        after_row.insert(
+            "read_density".into(),
+            format!("{:.6}", fragments as f64 / length as f64),
+        );
+        after_row.insert(
+            "unique_read_density".into(),
+            format!("{:.6}", unique as f64 / length as f64),
+        );
+    }
+    Ok((Some(evidence), "accepted".into()))
+}
+
+fn restore_prior_rescue_rounds(
+    sample: &Path,
+    backup: &Path,
+    current_round: usize,
+) -> Result<(), String> {
+    for round in 1..current_round {
+        let name = format!("uce_rescue_round_{round}");
+        let source = backup.join(&name);
+        let destination = sample.join(&name);
+        if source.is_dir() && !destination.exists() {
+            copy_tree(&source, &destination)?;
         }
     }
     Ok(())
@@ -870,8 +1347,9 @@ fn write_rescue_reports(
     initial: &UceSummary,
     final_rows: &UceSummary,
     rounds: &[(usize, String, UceSummary, UceSummary)],
+    report: &RescueReportContext,
 ) -> Result<(), String> {
-    let mut round_csv = String::from("sample,round,locus,round_status,before_length,after_length,length_delta,before_unique_reads,after_unique_reads,unique_read_delta\n");
+    let mut round_csv = String::from("sample,round,locus,round_status,before_status,after_status,before_length,after_length,length_delta,before_unique_reads,after_unique_reads,unique_read_delta,left_extension_length,left_breadth,left_max_gap,left_fragments,left_bridges,left_accepted,right_extension_length,right_breadth,right_max_gap,right_fragments,right_bridges,right_accepted\n");
     for (round, status, before, after) in rounds {
         for locus in before
             .rows
@@ -885,16 +1363,31 @@ fn write_rescue_reports(
                 .zip(uce_number(left, "selected_contig_length"))
                 .map(|(a, b)| (a - b).to_string())
                 .unwrap_or_default();
+            let key = (*round, locus.to_string());
+            let decision = report
+                .round_statuses
+                .get(&key)
+                .map(String::as_str)
+                .unwrap_or(status);
+            if *round > 1 && decision == "stable_not_recruited" {
+                continue;
+            }
             let read_delta = uce_number(right, "unique_read_count")
                 .zip(uce_number(left, "unique_read_count"))
                 .map(|(a, b)| (a - b).to_string())
                 .unwrap_or_default();
-            round_csv.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{}\n",
-                sample.name,
-                round,
-                locus,
-                status,
+            let mut fields = vec![
+                sample.name.clone(),
+                round.to_string(),
+                locus.to_string(),
+                decision.to_owned(),
+                left.and_then(|row| row.get("status"))
+                    .cloned()
+                    .unwrap_or_default(),
+                right
+                    .and_then(|row| row.get("status"))
+                    .cloned()
+                    .unwrap_or_default(),
                 left.and_then(|row| row.get("selected_contig_length"))
                     .cloned()
                     .unwrap_or_default(),
@@ -910,8 +1403,24 @@ fn write_rescue_reports(
                     .and_then(|row| row.get("unique_read_count"))
                     .cloned()
                     .unwrap_or_default(),
-                read_delta
-            ));
+                read_delta,
+            ];
+            if let Some(evidence) = report.terminal_audits.get(&key) {
+                for side in [&evidence.left, &evidence.right] {
+                    fields.extend([
+                        side.length.to_string(),
+                        format!("{:.6}", side.breadth),
+                        side.max_gap.to_string(),
+                        side.fragments.to_string(),
+                        side.bridges.to_string(),
+                        u8::from(side.accepted).to_string(),
+                    ]);
+                }
+            } else {
+                fields.extend(std::iter::repeat_n(String::new(), 12));
+            }
+            round_csv.push_str(&fields.join(","));
+            round_csv.push('\n');
         }
     }
     fs::write(directory.join("uce_rescue_rounds.csv"), round_csv).map_err(|e| e.to_string())?;
@@ -928,10 +1437,16 @@ fn write_rescue_reports(
             .zip(uce_number(before, "selected_contig_length"))
             .map(|(a, b)| (a - b).to_string())
             .unwrap_or_default();
+        let rescue_status = report
+            .status_by_locus
+            .get(locus)
+            .map(String::as_str)
+            .unwrap_or(&report.overall_status);
         summary_csv.push_str(&format!(
-            "{},{},success,{},{},{},{},{},{:.6},{:.6}\n",
+            "{},{},{},{},{},{},{},{},{:.6},{:.6}\n",
             sample.name,
             locus,
+            rescue_status,
             before
                 .and_then(|r| r.get("status"))
                 .cloned()
@@ -993,6 +1508,10 @@ fn execute_uce_rescue(
     let mut current = initial.clone();
     let mut previous = initial.clone();
     let mut records: Vec<(usize, String, UceSummary)> = Vec::new();
+    let mut report = RescueReportContext {
+        overall_status: "success".into(),
+        ..RescueReportContext::default()
+    };
     for round in 1..=maximum_rounds {
         let candidate = if round == 1 {
             None
@@ -1020,6 +1539,9 @@ fn execute_uce_rescue(
             candidate.as_ref(),
         )?;
         if added == 0 {
+            if round == 1 {
+                report.overall_status = "skipped".into();
+            }
             break;
         }
         let recruit = if let Some(active) = candidate.as_ref() {
@@ -1041,7 +1563,7 @@ fn execute_uce_rescue(
         }
         move_tree(sample_dir, &backup)?;
         let before = current.clone();
-        let result: Result<UceSummary, String> = (|| {
+        let result: Result<RescueRoundOutcome, String> = (|| {
             let filtered = sample_dir.join("filtered");
             if filtered.exists() {
                 fs::remove_dir_all(&filtered).map_err(|e| e.to_string())?;
@@ -1053,33 +1575,119 @@ fn execute_uce_rescue(
                     opt, sample, sample_dir, &reference, &recruit, "contig",
                 ),
             )?;
-            let mut rescue_opt = opt.clone();
-            rescue_opt.reference = reference.display().to_string();
             run(
                 bins,
                 "main_assembler-rust",
-                &uce_assembler_args(&rescue_opt, sample_dir, 1)?,
+                &uce_rescue_assembler_args(opt, sample_dir, &reference, 1)?,
             )?;
             let mut after = read_uce_summary(&sample_dir.join("uce_assembly_summary.csv"))?;
+            let mut statuses = std::collections::BTreeMap::new();
+            let mut evidence_by_locus = std::collections::BTreeMap::new();
             for (locus, before_row) in &before.rows {
                 let inactive = candidate
                     .as_ref()
                     .is_some_and(|active| !active.contains(locus));
-                let failed =
-                    uce_row_accepted(Some(before_row)) && !uce_row_accepted(after.rows.get(locus));
-                let density_drop = row_density(Some(before_row))
-                    .zip(row_density(after.rows.get(locus)))
-                    .is_some_and(|(old, new)| old > 0.0 && new / old < density_ratio);
-                if inactive || failed || density_drop {
+                if inactive {
                     restore_rescue_locus(sample_dir, &backup, locus)?;
                     after.rows.insert(locus.clone(), before_row.clone());
+                    statuses.insert(locus.clone(), "stable_not_recruited".into());
+                    continue;
+                }
+
+                if !uce_row_accepted(after.rows.get(locus)) {
+                    let status = if uce_row_accepted(Some(before_row)) {
+                        "reverted_failed_rescue"
+                    } else {
+                        "not_recovered"
+                    };
+                    restore_rescue_locus(sample_dir, &backup, locus)?;
+                    after.rows.insert(locus.clone(), before_row.clone());
+                    statuses.insert(locus.clone(), status.into());
+                    continue;
+                }
+
+                let density_drop = uce_row_accepted(Some(before_row))
+                    && row_density(Some(before_row))
+                        .zip(row_density(after.rows.get(locus)))
+                        .is_some_and(|(old, new)| old > 0.0 && new / old < density_ratio);
+                if density_drop {
+                    restore_rescue_locus(sample_dir, &backup, locus)?;
+                    after.rows.insert(locus.clone(), before_row.clone());
+                    statuses.insert(locus.clone(), "reverted_density_drop".into());
+                    continue;
+                }
+
+                if round > 1 && uce_row_accepted(Some(before_row)) {
+                    let after_row = after.rows.get_mut(locus).ok_or_else(|| {
+                        format!("accepted rescue locus {locus} is missing from summary")
+                    })?;
+                    let (evidence, terminal_status) =
+                        terminal_reconcile_locus(sample_dir, &backup, locus, after_row)?;
+                    if let Some(evidence) = evidence {
+                        evidence_by_locus.insert(locus.clone(), evidence);
+                    }
+                    if terminal_status == "missing_contig" || terminal_status == "core_changed" {
+                        restore_rescue_locus(sample_dir, &backup, locus)?;
+                        after.rows.insert(locus.clone(), before_row.clone());
+                        statuses.insert(locus.clone(), format!("reverted_{terminal_status}"));
+                        continue;
+                    }
+                    if terminal_status == "no_supported_extension" {
+                        restore_rescue_locus(sample_dir, &backup, locus)?;
+                        after.rows.insert(locus.clone(), before_row.clone());
+                        statuses.insert(locus.clone(), "stable_no_supported_extension".into());
+                        continue;
+                    }
+                    let evidence = evidence_by_locus
+                        .get(locus)
+                        .ok_or("terminal rescue accepted without evidence")?;
+                    statuses.insert(
+                        locus.clone(),
+                        format!(
+                            "terminal_left_{}_right_{}",
+                            if evidence.left.accepted {
+                                "kept"
+                            } else {
+                                "trimmed"
+                            },
+                            if evidence.right.accepted {
+                                "kept"
+                            } else {
+                                "trimmed"
+                            }
+                        ),
+                    );
+                } else {
+                    statuses.insert(locus.clone(), "accepted".into());
                 }
             }
             write_uce_summary(&sample_dir.join("uce_assembly_summary.csv"), &after)?;
-            Ok(after)
+            write_result_dict_from_uce_summary(sample_dir, &after)?;
+            restore_prior_rescue_rounds(sample_dir, &backup, round)?;
+            Ok(RescueRoundOutcome {
+                after,
+                statuses,
+                evidence_by_locus,
+            })
         })();
         match result {
-            Ok(after) => {
+            Ok(outcome) => {
+                let RescueRoundOutcome {
+                    after,
+                    statuses,
+                    evidence_by_locus,
+                } = outcome;
+                for (locus, status) in statuses {
+                    report
+                        .round_statuses
+                        .insert((round, locus.clone()), status.clone());
+                    if status != "stable_not_recruited" {
+                        report.status_by_locus.insert(locus, status);
+                    }
+                }
+                for (locus, evidence) in evidence_by_locus {
+                    report.terminal_audits.insert((round, locus), evidence);
+                }
                 records.push((
                     round,
                     if round == 1 {
@@ -1099,6 +1707,14 @@ fn execute_uce_rescue(
                     fs::remove_dir_all(sample_dir).map_err(|e| e.to_string())?;
                 }
                 move_tree(&backup, sample_dir)?;
+                report.overall_status = if records.is_empty() {
+                    "failed_rolled_back".into()
+                } else {
+                    format!(
+                        "success_round_{}_round_{round}_failed_rolled_back",
+                        round - 1
+                    )
+                };
                 eprintln!(
                     "Warning: UCE rescue round {round} rolled back for {}: {error}",
                     sample.name
@@ -1130,7 +1746,7 @@ fn execute_uce_rescue(
             )
         })
         .collect::<Vec<_>>();
-    write_rescue_reports(sample, sample_dir, &initial, &current, &pairs)
+    write_rescue_reports(sample, sample_dir, &initial, &current, &pairs, &report)
 }
 
 #[derive(Clone, Default)]
@@ -4594,6 +5210,7 @@ fn workflow_manifest_text(opt: &Options, samples: &[Sample]) -> Result<String, S
         format!("commands\t{}", manifest_value(opt.commands.join(","))),
         format!("assembly_mode\t{}", manifest_value(&opt.assembly_mode)),
         format!("workers\t{}", opt.workers),
+        format!("worker_source\t{}", manifest_value(&opt.worker_source)),
         format!("reference_path\t{}", manifest_value(reference.display())),
         format!("reference_sha256\t{}", path_sha256(reference)?),
         format!(
@@ -4762,6 +5379,154 @@ fn validate_parallelism(opt: &Options) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_cpu_list(raw: &str) -> Option<Vec<usize>> {
+    let mut cpus = BTreeSet::new();
+    for item in raw.trim().split(',').filter(|item| !item.is_empty()) {
+        if let Some((start, end)) = item.split_once('-') {
+            let start = start.trim().parse::<usize>().ok()?;
+            let end = end.trim().parse::<usize>().ok()?;
+            if start > end {
+                return None;
+            }
+            cpus.extend(start..=end);
+        } else {
+            cpus.insert(item.trim().parse::<usize>().ok()?);
+        }
+    }
+    (!cpus.is_empty()).then(|| cpus.into_iter().collect())
+}
+
+fn allowed_cpu_ids() -> Option<Vec<usize>> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        line.strip_prefix("Cpus_allowed_list:")
+            .and_then(parse_cpu_list)
+    })
+}
+
+fn physical_core_count(cpu_ids: &[usize], topology_root: &Path) -> Option<usize> {
+    let mut cores = BTreeSet::new();
+    for cpu in cpu_ids {
+        let topology = topology_root.join(format!("cpu{cpu}/topology"));
+        let package = fs::read_to_string(topology.join("physical_package_id")).ok()?;
+        let core = fs::read_to_string(topology.join("core_id")).ok()?;
+        cores.insert((package.trim().to_owned(), core.trim().to_owned()));
+    }
+    (!cores.is_empty()).then_some(cores.len())
+}
+
+fn parse_cpu_max(raw: &str) -> Option<usize> {
+    let mut fields = raw.split_whitespace();
+    let quota = fields.next()?;
+    if quota == "max" {
+        return None;
+    }
+    let quota = quota.parse::<u64>().ok()?;
+    let period = fields.next()?.parse::<u64>().ok()?;
+    (period > 0).then(|| (quota / period).max(1) as usize)
+}
+
+fn parse_cpu_cfs(quota: &str, period: &str) -> Option<usize> {
+    let quota = quota.trim().parse::<i64>().ok()?;
+    let period = period.trim().parse::<u64>().ok()?;
+    (quota > 0 && period > 0).then(|| ((quota as u64 / period).max(1)) as usize)
+}
+
+fn cgroup_tree_cpu_quota(
+    root: &Path,
+    relative: &Path,
+    quota_name: &str,
+    period_name: Option<&str>,
+) -> Option<usize> {
+    let mut directory = root.join(relative);
+    let mut limit = None;
+    loop {
+        let value = if let Some(period_name) = period_name {
+            fs::read_to_string(directory.join(quota_name))
+                .ok()
+                .zip(fs::read_to_string(directory.join(period_name)).ok())
+                .and_then(|(quota, period)| parse_cpu_cfs(&quota, &period))
+        } else {
+            fs::read_to_string(directory.join(quota_name))
+                .ok()
+                .and_then(|value| parse_cpu_max(&value))
+        };
+        if let Some(value) = value {
+            limit = Some(limit.map_or(value, |prior: usize| prior.min(value)));
+        }
+        if directory == root || !directory.pop() {
+            break;
+        }
+    }
+    limit
+}
+
+fn cgroup_cpu_quota() -> Option<usize> {
+    let v2 = cgroup_relative_path(None).and_then(|relative| {
+        cgroup_tree_cpu_quota(Path::new("/sys/fs/cgroup"), &relative, "cpu.max", None)
+    });
+    let v1 = cgroup_relative_path(Some("cpu")).and_then(|relative| {
+        ["/sys/fs/cgroup/cpu", "/sys/fs/cgroup/cpu,cpuacct"]
+            .into_iter()
+            .filter_map(|root| {
+                cgroup_tree_cpu_quota(
+                    Path::new(root),
+                    &relative,
+                    "cpu.cfs_quota_us",
+                    Some("cpu.cfs_period_us"),
+                )
+            })
+            .min()
+    });
+    match (v2, v1) {
+        (Some(v2), Some(v1)) => Some(v2.min(v1)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn scheduler_cpu_limit() -> Option<(String, usize)> {
+    ["SLURM_CPUS_PER_TASK", "PBS_NP", "NSLOTS"]
+        .into_iter()
+        .find_map(|name| {
+            let value = env::var(name).ok()?.parse::<usize>().ok()?;
+            (value > 0).then(|| (name.to_owned(), value))
+        })
+}
+
+fn auto_worker_budget() -> (usize, String) {
+    let allowed = allowed_cpu_ids();
+    let logical = allowed
+        .as_ref()
+        .map(Vec::len)
+        .or_else(|| thread::available_parallelism().ok().map(usize::from))
+        .unwrap_or(1)
+        .max(1);
+    let physical = allowed
+        .as_deref()
+        .and_then(|cpus| physical_core_count(cpus, Path::new("/sys/devices/system/cpu")))
+        .unwrap_or(logical)
+        .max(1);
+    let cgroup = cgroup_cpu_quota();
+    let scheduler = scheduler_cpu_limit();
+    let mut workers = physical;
+    if let Some(limit) = cgroup {
+        workers = workers.min(limit);
+    }
+    if let Some((_, limit)) = scheduler.as_ref() {
+        workers = workers.min(*limit);
+    }
+    let mut source =
+        format!("auto: {physical} physical core(s) from {logical} allowed logical CPU(s)");
+    if let Some(limit) = cgroup {
+        source.push_str(&format!(", cgroup quota {limit}"));
+    }
+    if let Some((name, limit)) = scheduler {
+        source.push_str(&format!(", {name}={limit}"));
+    }
+    (workers.max(1), source)
+}
+
 fn available_memory_mib() -> Option<u64> {
     let contents = fs::read_to_string("/proc/meminfo").ok()?;
     contents.lines().find_map(|line| {
@@ -4885,7 +5650,11 @@ fn execute_uce_original_schedule(
     let has_refilter = opt.commands.iter().any(|command| command == "refilter");
     let has_assemble = opt.commands.iter().any(|command| command == "assemble");
     let fused_filter = !opt.legacy_uce_filter;
+    // Preserve the upstream GeneMiner2 1--2-unit recruitment budget while
+    // keeping the UCEFilter component contract separate: UCEFilter currently
+    // implements exactly one compute worker.
     let filter_threads = if opt.workers < 4 { 1 } else { 2 };
+    let filter_compute_threads = 1;
     let assembler_threads = if opt.workers == 1 {
         1
     } else {
@@ -4953,7 +5722,7 @@ fn execute_uce_original_schedule(
                             &bins,
                             &sample,
                             profile.as_ref(),
-                            filter_threads,
+                            filter_compute_threads,
                             threads,
                         )
                     }
@@ -5024,6 +5793,7 @@ fn execute_native(mut opt: Options) -> Result<(), String> {
     if opt.workers == 0 {
         return Err("-p must be at least 1".into());
     }
+    eprintln!("CPU budget: {} ({})", opt.workers, opt.worker_source);
     validate_cleanup_options(&opt)?;
     validate_parallelism(&opt)?;
     let bins = components()?;
@@ -5384,8 +6154,15 @@ fn execute_native(mut opt: Options) -> Result<(), String> {
 }
 
 fn print_help() {
+    let (workers, source) = auto_worker_budget();
     println!(
-        "GeneMiner2 Rust CLI\n\nNative Rust command dispatcher; no Python runtime is required."
+        "GeneMiner2 Rust CLI\n\nNative Rust command dispatcher; no Python runtime is required.\n\n\
+Usage: geneminer2 [COMMAND ...] -f SAMPLES -r REFERENCES -o OUTPUT [-p INT|auto]\n\n\
+Parallelism:\n  \
+-p INT|auto  Shared CPU budget. The default is auto, which counts physical\n               \
+cores allowed by affinity/cpuset and caps them by cgroup or scheduler limits.\n               \
+Use an integer to override automatic detection.\n\n\
+Detected auto budget: {workers} ({source})"
     );
 }
 
@@ -5407,6 +6184,281 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_lists_expand_ranges_and_reject_invalid_input() {
+        assert_eq!(
+            parse_cpu_list("0-3,8,10-11"),
+            Some(vec![0, 1, 2, 3, 8, 10, 11])
+        );
+        assert_eq!(parse_cpu_list("3-1"), None);
+        assert_eq!(parse_cpu_list(""), None);
+    }
+
+    #[test]
+    fn physical_cores_are_deduplicated_across_smt_siblings() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gm2_cpu_topology_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        for (cpu, package, core) in [(0, 0, 0), (1, 0, 0), (2, 0, 1), (3, 1, 0)] {
+            let topology = root.join(format!("cpu{cpu}/topology"));
+            fs::create_dir_all(&topology).unwrap();
+            fs::write(topology.join("physical_package_id"), package.to_string()).unwrap();
+            fs::write(topology.join("core_id"), core.to_string()).unwrap();
+        }
+        assert_eq!(physical_core_count(&[0, 1, 2, 3], &root), Some(3));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cpu_quota_parsers_are_conservative_and_handle_unlimited_values() {
+        assert_eq!(parse_cpu_max("max 100000"), None);
+        assert_eq!(parse_cpu_max("250000 100000"), Some(2));
+        assert_eq!(parse_cpu_max("50000 100000"), Some(1));
+        assert_eq!(parse_cpu_cfs("-1", "100000"), None);
+        assert_eq!(parse_cpu_cfs("1200000", "100000"), Some(12));
+    }
+
+    #[test]
+    fn worker_budget_defaults_to_auto_and_explicit_values_override_it() {
+        let auto = parse(&[
+            "stats".into(),
+            "-f".into(),
+            "samples.tsv".into(),
+            "-r".into(),
+            "references".into(),
+            "-o".into(),
+            "out".into(),
+        ])
+        .unwrap();
+        assert!(auto.workers >= 1);
+        assert!(auto.worker_source.starts_with("auto:"));
+        let explicit = resolve_worker_budget("12").unwrap();
+        assert_eq!(explicit.0, 12);
+        assert_eq!(explicit.1, "explicit -p 12");
+        assert!(resolve_worker_budget("0").is_err());
+        assert!(resolve_worker_budget("physical").is_err());
+    }
+
+    #[test]
+    fn uce_rescue_uses_fixed_k21_without_changing_normal_assembly_kmer() {
+        let opt = parse(&[
+            "assemble".into(),
+            "--assembly-mode".into(),
+            "uce".into(),
+            "-p".into(),
+            "1".into(),
+            "-f".into(),
+            "samples.tsv".into(),
+            "-r".into(),
+            "references".into(),
+            "-o".into(),
+            "out".into(),
+            "-ka".into(),
+            "51".into(),
+        ])
+        .unwrap();
+        let normal = uce_assembler_args(&opt, Path::new("sample"), 1).unwrap();
+        let rescue =
+            uce_rescue_assembler_args(&opt, Path::new("sample"), Path::new("rescue"), 1).unwrap();
+        let argument_value = |args: &[String], name: &str| {
+            let index = args
+                .iter()
+                .position(|argument| argument == name)
+                .expect("argument is present");
+            args[index + 1].clone()
+        };
+        assert_eq!(argument_value(&normal, "-ka"), "51");
+        assert_eq!(argument_value(&rescue, "-ka"), UCE_RESCUE_ASSEMBLY_KMER);
+        assert_eq!(argument_value(&normal, "-r"), "references");
+        assert_eq!(argument_value(&rescue, "-r"), "rescue");
+    }
+
+    fn test_dna(length: usize, seed: u64) -> String {
+        let mut state = seed;
+        (0..length)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                b"ACGT"[(state >> 62) as usize] as char
+            })
+            .collect()
+    }
+
+    #[test]
+    fn terminal_rescue_reference_contains_only_active_loci() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("gm2_terminal_refs_{}_{unique}", std::process::id()));
+        let reference = root.join("reference");
+        let sample = root.join("sample");
+        let rescue = root.join("rescue");
+        fs::create_dir_all(&reference).unwrap();
+        fs::create_dir_all(sample.join("results")).unwrap();
+        fs::write(reference.join("active.fasta"), ">ref\nAAAA\n").unwrap();
+        fs::write(reference.join("inactive.fasta"), ">ref\nCCCC\n").unwrap();
+        fs::write(sample.join("results/active.fasta"), ">contig\nAAAAGGGG\n").unwrap();
+        fs::write(
+            sample.join("uce_assembly_summary.csv"),
+            "locus,status,accepted,low_quality\nactive,success,1,0\ninactive,success,1,0\n",
+        )
+        .unwrap();
+        let active = ["active".to_owned()].into_iter().collect();
+        assert_eq!(
+            build_uce_rescue_reference(&reference, &sample, &rescue, 4, Some(&active)).unwrap(),
+            1
+        );
+        assert!(rescue.join("active.fasta").is_file());
+        assert!(!rescue.join("inactive.fasta").exists());
+        assert!(fs::read_to_string(rescue.join("active.fasta"))
+            .unwrap()
+            .contains("AAAAGGGG"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terminal_reconcile_keeps_supported_side_and_preserves_candidates() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gm2_terminal_reconcile_{}_{unique}",
+            std::process::id()
+        ));
+        let sample = root.join("sample");
+        let backup = root.join("backup");
+        for directory in [
+            sample.join("results"),
+            sample.join("filtered"),
+            sample.join("contigs_all"),
+            sample.join("contigs_all_low"),
+            backup.join("results"),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let left = test_dna(40, 1);
+        let core = test_dna(120, 2);
+        let right = test_dna(40, 3);
+        let assembled = format!("{left}{core}{right}");
+        fs::write(
+            backup.join("results/locus.fasta"),
+            format!(">old\n{core}\n"),
+        )
+        .unwrap();
+        fs::write(
+            sample.join("results/locus.fasta"),
+            format!(">new\n{assembled}\n"),
+        )
+        .unwrap();
+        let candidates = format!(">candidate_1\n{assembled}\n>candidate_2\nACGT\n");
+        fs::write(sample.join("contigs_all/locus.fasta"), &candidates).unwrap();
+        fs::write(sample.join("contigs_all_low/locus.fasta"), &candidates).unwrap();
+        let spanning = &assembled[..100];
+        let fastq = ["frag1", "frag2"]
+            .into_iter()
+            .map(|fragment| {
+                format!(
+                    "@{fragment}/1\n{spanning}\n+\n{}\n",
+                    "I".repeat(spanning.len())
+                )
+            })
+            .collect::<String>();
+        fs::write(sample.join("filtered/locus.fq"), fastq).unwrap();
+        let mut after = std::collections::BTreeMap::from([
+            ("selected_contig_length".into(), assembled.len().to_string()),
+            ("unique_read_count".into(), "2".into()),
+        ]);
+        let (evidence, status) =
+            terminal_reconcile_locus(&sample, &backup, "locus", &mut after).unwrap();
+        let evidence = evidence.unwrap();
+        assert_eq!(status, "accepted");
+        assert!(evidence.left.accepted);
+        assert!(!evidence.right.accepted);
+        assert_eq!(
+            first_fasta_sequence(&sample.join("results/locus.fasta")).unwrap(),
+            Some(format!("{left}{core}"))
+        );
+        assert_eq!(
+            fs::read_to_string(sample.join("contigs_all/locus.fasta")).unwrap(),
+            candidates
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prior_rescue_round_evidence_survives_a_later_round() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gm2_rescue_evidence_{}_{unique}",
+            std::process::id()
+        ));
+        let sample = root.join("sample");
+        let backup = root.join("backup");
+        fs::create_dir_all(&sample).unwrap();
+        fs::create_dir_all(backup.join("uce_rescue_round_1")).unwrap();
+        fs::write(backup.join("uce_rescue_round_1/evidence.txt"), "round one").unwrap();
+        restore_prior_rescue_rounds(&sample, &backup, 2).unwrap();
+        assert_eq!(
+            fs::read_to_string(sample.join("uce_rescue_round_1/evidence.txt")).unwrap(),
+            "round one"
+        );
+        assert!(backup.join("uce_rescue_round_1/evidence.txt").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rescue_summary_uses_per_locus_status() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("gm2_rescue_report_{}_{unique}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let row = std::collections::BTreeMap::from([
+            ("locus".into(), "locus".into()),
+            ("status".into(), "success".into()),
+            ("accepted".into(), "1".into()),
+            ("selected_contig_length".into(), "100".into()),
+            ("unique_read_count".into(), "2".into()),
+        ]);
+        let summary = UceSummary {
+            headers: row.keys().cloned().collect(),
+            rows: std::collections::BTreeMap::from([("locus".into(), row)]),
+        };
+        let sample = Sample {
+            name: "sample".into(),
+            read1: String::new(),
+            read2: None,
+        };
+        let report = RescueReportContext {
+            status_by_locus: std::collections::BTreeMap::from([(
+                "locus".into(),
+                "reverted_density_drop".into(),
+            )]),
+            overall_status: "success".into(),
+            ..RescueReportContext::default()
+        };
+        write_rescue_reports(&sample, &directory, &summary, &summary, &[], &report).unwrap();
+        assert!(fs::read_to_string(directory.join("uce_rescue_summary.csv"))
+            .unwrap()
+            .contains("sample,locus,reverted_density_drop"));
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn move_tree_relocates_nested_content_and_clears_the_source() {
@@ -5553,11 +6605,11 @@ mod tests {
         for (workers, expected_filter_threads, mut expected_assembler_threads) in [
             (1, 1, vec![1, 1]),
             (2, 1, vec![2, 2]),
-            (4, 2, vec![2, 2]),
-            // Once both filters release their 2-thread reservations, the
-            // first ready assembler may consume the six available threads;
+            (4, 1, vec![2, 2]),
+            // Once both filters release their 2-unit reservations, the first
+            // ready assembler may consume the six available budget units;
             // the remaining job receives the normal 4-thread share.
-            (8, 2, vec![4, 6]),
+            (8, 1, vec![4, 6]),
         ] {
             fs::write(&capture, "").unwrap();
             let output = root.join(format!("output_p{workers}"));
@@ -5580,6 +6632,7 @@ mod tests {
             let manifest = fs::read_to_string(output.join("workflow_manifest.tsv")).unwrap();
             assert!(manifest.contains("schema_version\t1\n"));
             assert!(manifest.contains("assembly_mode\tuce\n"));
+            assert!(manifest.contains("worker_source\texplicit -p"));
             assert!(manifest.contains("sample_count\t2\n"));
             let status = fs::read_to_string(output.join("workflow_status.tsv")).unwrap();
             assert!(status.contains("state\tsucceeded\n"));
