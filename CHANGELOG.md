@@ -4,6 +4,12 @@
 
 - Renamed the public project to TStools (formerly GeneMiner2-UCE). Repository URLs, `cli/geneminer2`, legacy output identifiers, and scholarly citations remain unchanged for compatibility.
 
+## v1.5.9 — UCE scheduling and rescue correctness
+
+- Made the default shared CPU budget `-p auto`: it detects physical cores permitted by affinity or cpuset constraints, then caps that value using cgroup or scheduler limits. Explicit integer values still override auto-detection, while UCEFilter's single supported compute worker remains separate from recruitment's 1--2-unit reservation.
+- Hardened UCE raw-read rescue: rescue assembly now uses fixed k=21, preserves only active loci in the rescue reference, and retains evidence from prior rounds. Every terminal extension is independently checked for length, breadth, gap, fragment, and bridge support; failed extensions revert without discarding accepted evidence.
+- Added regression coverage for automatic CPU budgeting, fixed-k rescue assembly, active-locus rescue references, terminal-evidence acceptance, cross-round evidence preservation, and per-locus rescue-status reporting.
+
 ## v1.5.7 — UCE rescue I/O and PanRefV2.2 graph evidence
 
 - Avoided byte-for-byte sample-directory copies during UCE rescue. Rescue now stages work outside the sample directory and atomically moves the settled round back, preserving rollback and output layout while reducing slow-disk I/O.
