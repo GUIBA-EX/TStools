@@ -233,7 +233,7 @@ The tables below list the main public options and current defaults. Run `cli/gen
 | `-f FILE` | Sample table; required |
 | `-r DIR` | Reference-sequence directory; required |
 | `-o DIR` | Output directory; required |
-| `-p INT` | Total parallel-process limit; default `1` |
+| `-p INT\|auto` | Shared CPU budget; default `auto`. Auto counts affinity/cpuset-allowed physical cores and applies cgroup or scheduler limits; an integer overrides detection. |
 
 ### 7.2 Read filtering and refiltering
 
