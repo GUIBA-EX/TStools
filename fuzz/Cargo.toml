@@ -17,3 +17,6 @@ path = "fuzz_targets/fastx_parser.rs"
 test = false
 doc = false
 bench = false
+
+# Keep the fuzz harness independent from the repository main workspace.
+[workspace]
