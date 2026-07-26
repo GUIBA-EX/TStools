@@ -12,6 +12,9 @@ jobs:
   fastx:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # This workflow needs nightly, while normal builds remain pinned by rust-toolchain.toml.
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v7
 
