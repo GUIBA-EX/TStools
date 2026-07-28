@@ -45,6 +45,9 @@ Assembly mode:
   --uce-path-strategy search|backbone
                                    UCE path handling (default: backbone)
   --uce-backbone-lookahead INT    Bounded branch look-ahead (default: 24)
+  --uce-reverse-reuse-reference-scale FLOAT
+                                   Scale reference bonus on reverse path reuse
+                                   (default: 1.0; no scaling)
   --uce-side-candidates INT       Legacy search candidates per side (default: 8)
   --uce-max-contig-length INT     UCE length guardrail; 0 disables (default: 0)
   --uce-min-read-density FLOAT    Long-contig unique-read density (default: 0.003)
@@ -107,6 +110,7 @@ fn parse_args() -> Result<Args, String> {
         side_candidates: 8,
         path_strategy: PathStrategy::Backbone,
         backbone_lookahead: 24,
+        reverse_reuse_reference_scale: 1.0,
         max_contig_length: 0,
         min_read_density: 0.003,
         density_check_min_length: 1000,
@@ -159,6 +163,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--uce-backbone-lookahead" => {
                 args.backbone_lookahead = parse_number(&arguments, &mut index, flag)?
+            }
+            "--uce-reverse-reuse-reference-scale" => {
+                args.reverse_reuse_reference_scale = parse_number(&arguments, &mut index, flag)?
             }
             "--uce-side-candidates" => {
                 args.side_candidates = parse_number(&arguments, &mut index, flag)?
@@ -223,6 +230,9 @@ fn parse_args() -> Result<Args, String> {
     }
     if args.min_read_density < 0.0 || args.max_depth_cv < 0.0 || args.max_depth_ratio < 0.0 {
         return Err("UCE guardrail values must be non-negative".to_string());
+    }
+    if !(0.0..=1.0).contains(&args.reverse_reuse_reference_scale) {
+        return Err("--uce-reverse-reuse-reference-scale must be in [0, 1]".to_string());
     }
     Ok(args)
 }

@@ -355,6 +355,9 @@ pub fn run_manifest(args: &Args, tasks: &[LocusTask]) -> io::Result<String> {
     args.side_candidates.hash(&mut hasher);
     args.path_strategy.hash(&mut hasher);
     args.backbone_lookahead.hash(&mut hasher);
+    args.reverse_reuse_reference_scale
+        .to_bits()
+        .hash(&mut hasher);
     args.max_contig_length.hash(&mut hasher);
     args.min_read_density.to_bits().hash(&mut hasher);
     args.density_check_min_length.hash(&mut hasher);

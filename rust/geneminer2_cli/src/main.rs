@@ -2,8 +2,10 @@
 //!
 //! The public CLI is implemented in Rust and does not require a Python runtime.
 
+mod rescue_qc;
+
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Read};
@@ -22,6 +24,8 @@ const UCE_TERMINAL_MIN_BREADTH: f64 = 0.85;
 const UCE_TERMINAL_MAX_GAP: usize = 30;
 const UCE_TERMINAL_MIN_FRAGMENTS: usize = 2;
 const UCE_TERMINAL_MIN_BRIDGES: usize = 1;
+const UCE_INVERTED_REPEAT_KMER: usize = 21;
+const UCE_INVERTED_REPEAT_MAX_KMER_OCCURRENCES: usize = 64;
 
 const COMMANDS: &[&str] = &[
     "filter",
@@ -209,6 +213,8 @@ const VALUE_OPTIONS: &[&str] = &[
     "--uce-rescue-min-contig-length",
     "--uce-rescue-terminal-window",
     "--uce-rescue-min-density-ratio",
+    "--uce-rescue-reverse-reuse-reference-scale",
+    "--uce-rescue-inverted-repeat-min-bp",
     "--assembler-implementation",
     "--assembler-read-chunk-size",
     "--uce-path-strategy",
@@ -786,10 +792,23 @@ fn uce_rescue_assembler_args(
     reference: &Path,
     threads: usize,
 ) -> Result<Vec<String>, String> {
+    let scale = value(
+        &opt.raw,
+        &["--uce-rescue-reverse-reuse-reference-scale"],
+        "1.0",
+    )?;
+    let parsed = scale
+        .parse::<f64>()
+        .map_err(|_| "--uce-rescue-reverse-reuse-reference-scale must be a number".to_string())?;
+    if !(0.0..=1.0).contains(&parsed) {
+        return Err("--uce-rescue-reverse-reuse-reference-scale must be in [0, 1]".into());
+    }
     let mut rescue_opt = opt.clone();
     rescue_opt.reference = reference.display().to_string();
     rescue_opt.ka = UCE_RESCUE_ASSEMBLY_KMER.into();
-    uce_assembler_args(&rescue_opt, sample_dir, threads)
+    let mut args = uce_assembler_args(&rescue_opt, sample_dir, threads)?;
+    args.extend(["--uce-reverse-reuse-reference-scale".into(), scale]);
+    Ok(args)
 }
 
 fn build_uce_rescue_reference(
@@ -1060,6 +1079,151 @@ fn reverse_complement_text(sequence: &str) -> String {
             _ => 'N',
         })
         .collect()
+}
+
+fn encode_dna_kmer(sequence: &[u8]) -> Option<u64> {
+    let mut encoded = 0_u64;
+    for base in sequence {
+        encoded = (encoded << 2)
+            | match base.to_ascii_uppercase() {
+                b'A' => 0,
+                b'C' => 1,
+                b'G' => 2,
+                b'T' => 3,
+                _ => return None,
+            };
+    }
+    Some(encoded)
+}
+
+fn reverse_complement_packed(mut encoded: u64, k: usize) -> u64 {
+    let mut reverse = 0_u64;
+    for _ in 0..k {
+        reverse = (reverse << 2) | (3 - (encoded & 3));
+        encoded >>= 2;
+    }
+    reverse
+}
+
+/// Detects an exact, long, self reverse-complement match. The 21-mer chains
+/// are grouped by anti-diagonal, so a forward run at increasing positions is
+/// paired with a reverse-complement run at decreasing positions. Highly
+/// repetitive 21-mers are ignored to keep the rescue guard bounded.
+fn has_long_inverted_repeat(sequence: &str, minimum_span: usize) -> bool {
+    let k = UCE_INVERTED_REPEAT_KMER;
+    if minimum_span == 0 || sequence.len() < k || sequence.len() < minimum_span {
+        return false;
+    }
+    let bytes = sequence.as_bytes();
+    let encoded = (0..=bytes.len() - k)
+        .map(|start| encode_dna_kmer(&bytes[start..start + k]))
+        .collect::<Vec<_>>();
+    let mut positions: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (position, kmer) in encoded.iter().enumerate() {
+        let Some(kmer) = kmer else {
+            continue;
+        };
+        let bucket = positions.entry(*kmer).or_default();
+        if bucket.len() <= UCE_INVERTED_REPEAT_MAX_KMER_OCCURRENCES {
+            bucket.push(position);
+        }
+    }
+
+    let mut pairs = Vec::new();
+    for (left, kmer) in encoded.iter().enumerate() {
+        let Some(kmer) = kmer else {
+            continue;
+        };
+        let reverse = reverse_complement_packed(*kmer, k);
+        let Some(matches) = positions.get(&reverse) else {
+            continue;
+        };
+        if matches.len() > UCE_INVERTED_REPEAT_MAX_KMER_OCCURRENCES {
+            continue;
+        }
+        pairs.extend(
+            matches
+                .iter()
+                .copied()
+                .filter(|right| *right > left)
+                .map(|right| (left + right, left, right)),
+        );
+    }
+    pairs.sort_unstable();
+
+    let mut chain_start = None::<(usize, usize, usize)>;
+    let mut previous = None::<(usize, usize, usize)>;
+    for (diagonal, left, right) in pairs {
+        let consecutive = previous.is_some_and(|(old_diagonal, old_left, old_right)| {
+            diagonal == old_diagonal && left == old_left + 1 && right + 1 == old_right
+        });
+        if !consecutive {
+            chain_start = Some((diagonal, left, right));
+        }
+        previous = Some((diagonal, left, right));
+        let Some((_, start_left, start_right)) = chain_start else {
+            continue;
+        };
+        let span = left - start_left + k;
+        if span < minimum_span {
+            continue;
+        }
+        let first_start = start_left;
+        let first_end = left + k;
+        let second_start = right;
+        let second_end = start_right + k;
+        let overlap = first_end
+            .min(second_end)
+            .saturating_sub(first_start.max(second_start));
+        if overlap.saturating_mul(5) <= span {
+            return true;
+        }
+    }
+    false
+}
+
+fn locus_result_sequence(root: &Path, locus: &str) -> Result<Option<String>, String> {
+    let path = root.join("results").join(format!("{locus}.fasta"));
+    if !path.is_file() {
+        return Ok(None);
+    }
+    first_fasta_sequence(&path)
+}
+
+fn rescue_introduces_long_inverted_repeat(
+    sample: &Path,
+    backup: &Path,
+    locus: &str,
+    minimum_span: usize,
+) -> Result<bool, String> {
+    if minimum_span == 0 {
+        return Ok(false);
+    }
+    let before = locus_result_sequence(backup, locus)?;
+    let after = locus_result_sequence(sample, locus)?;
+    let before_has_repeat = before
+        .as_deref()
+        .is_some_and(|sequence| has_long_inverted_repeat(sequence, minimum_span));
+    let after_has_repeat = after
+        .as_deref()
+        .is_some_and(|sequence| has_long_inverted_repeat(sequence, minimum_span));
+    Ok(!before_has_repeat && after_has_repeat)
+}
+
+fn rescue_introduces_unsupported_internal_gap(
+    sample: &Path,
+    backup: &Path,
+    locus: &str,
+) -> Result<bool, String> {
+    let before = locus_result_sequence(backup, locus)?;
+    let after = locus_result_sequence(sample, locus)?;
+    let (Some(before), Some(after)) = (before, after) else {
+        return Ok(false);
+    };
+    let reads = read_locus_fastq(sample, locus)?;
+    Ok(rescue_qc::introduces_unsupported_internal_gap(
+        &before, &after, &reads,
+    ))
 }
 
 fn read_locus_fastq(sample: &Path, locus: &str) -> Result<Vec<(String, String)>, String> {
@@ -1504,6 +1668,12 @@ fn execute_uce_rescue(
     if !(0.0..=1.0).contains(&density_ratio) {
         return Err("--uce-rescue-min-density-ratio must be in [0, 1]".into());
     }
+    let inverted_repeat_minimum = raw_number::<usize>(
+        &opt.raw,
+        &["--uce-rescue-inverted-repeat-min-bp"],
+        "150",
+        "--uce-rescue-inverted-repeat-min-bp",
+    )?;
     let initial = read_uce_summary(&sample_dir.join("uce_assembly_summary.csv"))?;
     let mut current = initial.clone();
     let mut previous = initial.clone();
@@ -1617,7 +1787,7 @@ fn execute_uce_rescue(
                     continue;
                 }
 
-                if round > 1 && uce_row_accepted(Some(before_row)) {
+                let accepted_status = if round > 1 && uce_row_accepted(Some(before_row)) {
                     let after_row = after.rows.get_mut(locus).ok_or_else(|| {
                         format!("accepted rescue locus {locus} is missing from summary")
                     })?;
@@ -1641,25 +1811,45 @@ fn execute_uce_rescue(
                     let evidence = evidence_by_locus
                         .get(locus)
                         .ok_or("terminal rescue accepted without evidence")?;
-                    statuses.insert(
-                        locus.clone(),
-                        format!(
-                            "terminal_left_{}_right_{}",
-                            if evidence.left.accepted {
-                                "kept"
-                            } else {
-                                "trimmed"
-                            },
-                            if evidence.right.accepted {
-                                "kept"
-                            } else {
-                                "trimmed"
-                            }
-                        ),
-                    );
+                    format!(
+                        "terminal_left_{}_right_{}",
+                        if evidence.left.accepted {
+                            "kept"
+                        } else {
+                            "trimmed"
+                        },
+                        if evidence.right.accepted {
+                            "kept"
+                        } else {
+                            "trimmed"
+                        }
+                    )
                 } else {
-                    statuses.insert(locus.clone(), "accepted".into());
+                    "accepted".into()
+                };
+
+                if rescue_introduces_long_inverted_repeat(
+                    sample_dir,
+                    &backup,
+                    locus,
+                    inverted_repeat_minimum,
+                )? {
+                    restore_rescue_locus(sample_dir, &backup, locus)?;
+                    after.rows.insert(locus.clone(), before_row.clone());
+                    evidence_by_locus.remove(locus);
+                    statuses.insert(locus.clone(), "reverted_inverted_repeat".into());
+                    continue;
                 }
+                if uce_row_accepted(Some(before_row))
+                    && rescue_introduces_unsupported_internal_gap(sample_dir, &backup, locus)?
+                {
+                    restore_rescue_locus(sample_dir, &backup, locus)?;
+                    after.rows.insert(locus.clone(), before_row.clone());
+                    evidence_by_locus.remove(locus);
+                    statuses.insert(locus.clone(), "reverted_unsupported_internal_gap".into());
+                    continue;
+                }
+                statuses.insert(locus.clone(), accepted_status);
             }
             write_uce_summary(&sample_dir.join("uce_assembly_summary.csv"), &after)?;
             write_result_dict_from_uce_summary(sample_dir, &after)?;
@@ -6162,6 +6352,15 @@ Parallelism:\n  \
 -p INT|auto  Shared CPU budget. The default is auto, which counts physical\n               \
 cores allowed by affinity/cpuset and caps them by cgroup or scheduler limits.\n               \
 Use an integer to override automatic detection.\n\n\
+UCE rescue:\n  \
+--uce-rescue-reads  Enable rescue after the initial UCE assembly.\n  \
+--uce-rescue-rounds 1|2  Number of rescue rounds (default: 2).\n  \
+--uce-rescue-reverse-reuse-reference-scale FLOAT\n               \
+Scale only the reference bonus when a reverse-complement node is already\n               \
+present in either rescue assembly arm (default: 1.0; range: 0-1; 1 disables).\n  \
+--uce-rescue-inverted-repeat-min-bp INT\n               \
+Roll back a locus when rescue newly introduces an exact long inverted repeat\n               \
+(default: 150 bp; 0 disables).\n\n\
 Detected auto budget: {workers} ({source})"
     );
 }
@@ -6278,6 +6477,13 @@ mod tests {
         assert_eq!(argument_value(&rescue, "-ka"), UCE_RESCUE_ASSEMBLY_KMER);
         assert_eq!(argument_value(&normal, "-r"), "references");
         assert_eq!(argument_value(&rescue, "-r"), "rescue");
+        assert!(!normal
+            .iter()
+            .any(|argument| argument == "--uce-reverse-reuse-reference-scale"));
+        assert_eq!(
+            argument_value(&rescue, "--uce-reverse-reuse-reference-scale"),
+            "1.0"
+        );
     }
 
     fn test_dna(length: usize, seed: u64) -> String {
@@ -6290,6 +6496,63 @@ mod tests {
                 b"ACGT"[(state >> 62) as usize] as char
             })
             .collect()
+    }
+
+    #[test]
+    fn long_inverted_repeat_detector_finds_exact_nonoverlapping_arms() {
+        let arm = test_dna(180, 41);
+        let sequence = format!(
+            "{}{}{}",
+            arm,
+            test_dna(60, 42),
+            reverse_complement_text(&arm)
+        );
+        assert!(has_long_inverted_repeat(&sequence, 150));
+        assert!(!has_long_inverted_repeat(&sequence, 200));
+        assert!(!has_long_inverted_repeat(&test_dna(700, 43), 150));
+        assert!(!has_long_inverted_repeat("NNNNACGTNNNN", 10));
+    }
+
+    #[test]
+    fn rescue_guard_only_flags_a_new_long_inverted_repeat() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gm2_inverted_repeat_guard_{}_{unique}",
+            std::process::id()
+        ));
+        let sample = root.join("sample");
+        let backup = root.join("backup");
+        fs::create_dir_all(sample.join("results")).unwrap();
+        fs::create_dir_all(backup.join("results")).unwrap();
+        let arm = test_dna(180, 44);
+        let before = test_dna(500, 45);
+        let after = format!(
+            "{arm}{before}{}{}",
+            test_dna(60, 46),
+            reverse_complement_text(&arm)
+        );
+        fs::write(
+            backup.join("results/locus.fasta"),
+            format!(">before\n{before}\n"),
+        )
+        .unwrap();
+        fs::write(
+            sample.join("results/locus.fasta"),
+            format!(">after\n{after}\n"),
+        )
+        .unwrap();
+        assert!(rescue_introduces_long_inverted_repeat(&sample, &backup, "locus", 150).unwrap());
+
+        fs::write(
+            backup.join("results/locus.fasta"),
+            format!(">before\n{after}\n"),
+        )
+        .unwrap();
+        assert!(!rescue_introduces_long_inverted_repeat(&sample, &backup, "locus", 150).unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

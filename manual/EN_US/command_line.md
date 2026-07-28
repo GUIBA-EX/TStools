@@ -265,6 +265,9 @@ The tables below list the main public options and current defaults. Run `cli/gen
 | `--assembly-mode MODE` | `original` or `uce`; default `original` |
 | `--assembly-mode uce` | Uses UCEFilter by default, with fixed safe backbone and QC settings; UCE advanced tuning is intentionally hidden |
 | `--uce-rescue-reads` | Optional fixed-k=21 bounded rescue: whole-contig first, then terminal-only |
+| `--uce-rescue-rounds 1\|2` | Number of rescue rounds; default `2` |
+| `--uce-rescue-inverted-repeat-min-bp INT` | Revert a locus when the current rescue round newly introduces an exact inverted repeat of at least this length; default `150`, `0` disables |
+| `--uce-rescue-reverse-reuse-reference-scale FLOAT` | Experimental: scale the reference bonus for a node whose reverse complement is already present in either assembly arm; range `0`--`1`, default `1.0` (disabled), with read depth unchanged |
 
 ### 7.4 Population options
 

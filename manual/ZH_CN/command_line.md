@@ -265,6 +265,9 @@ cli/geneminer2 stats \
 | `--assembly-mode MODE` | `original` 或 `uce`；默认 `original` |
 | `--assembly-mode uce` | 默认使用 UCEFilter，并采用固定的 backbone 与 QC 安全设置；高级 UCE 调参默认隐藏 |
 | `--uce-rescue-reads` | 可选固定 k=21 的受控 rescue：首轮 whole-contig，随后 terminal-only |
+| `--uce-rescue-rounds 1\|2` | rescue 轮数；默认 `2` |
+| `--uce-rescue-inverted-repeat-min-bp INT` | 若本轮 rescue 新引入至少该长度的精确倒置重复，则逐 locus 回退；默认 `150`，`0` 关闭 |
+| `--uce-rescue-reverse-reuse-reference-scale FLOAT` | 实验性：缩放与任一组装臂已走路径互为反向互补节点的 reference bonus；范围 `0`--`1`，默认 `1.0`（关闭缩放），不改变 reads depth |
 
 ### 7.4 Population
 
