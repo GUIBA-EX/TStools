@@ -563,12 +563,37 @@ fn finalize(options: &HashMap<String, String>) -> Result<(), String> {
         .next()
         .ok_or("empty mitochondrial reference")?
         .1;
-    let contigs: Vec<MitoContig> = read_fasta(Path::new(required(options, "--contigs")))?
-        .into_iter()
-        .map(|(id, sequence)| MitoContig { id, sequence })
-        .collect();
+    let require_circular = options
+        .get("--require-circular")
+        .is_some_and(|value| matches!(value.as_str(), "true" | "1" | "yes"));
+    let contig_path = Path::new(required(options, "--contigs"));
+    let contigs: Vec<MitoContig> = if contig_path.is_file() {
+        read_fasta(contig_path)?
+            .into_iter()
+            .map(|(id, sequence)| MitoContig { id, sequence })
+            .collect()
+    } else {
+        Vec::new()
+    };
     if contigs.is_empty() {
-        return Err("GM2 UCE assembler produced no mitochondrial contigs".into());
+        if require_circular {
+            return Err(
+                "GM2 mitochondrial assembly is no_contigs; a read-supported circular genome is required"
+                    .into(),
+            );
+        }
+        // An adaptive depth is a checkpoint, not a complete run. At shallow
+        // depths there may not yet be enough recruited reads to produce a
+        // contig, so record that observation and let the caller try more reads.
+        let output = Path::new(required(options, "--out-dir"));
+        fs::create_dir_all(output).map_err(|error| error.to_string())?;
+        write_fasta(&output.join("mitochondrial_assembly.fasta"), &[])?;
+        fs::write(
+            output.join("mitochondrial_assembly_summary.tsv"),
+            "status\tno_contigs\nresolution_reason\tno_assembled_contigs\ncomponent_count\t0\n",
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(());
     }
     let config = LinkConfig {
         minimum_overlap: number(options, "--minimum-overlap", 41)?,
@@ -612,9 +637,6 @@ fn finalize(options: &HashMap<String, String>) -> Result<(), String> {
             write_standardized(out_dir, &reference, Path::new(metadata), &assembly)?;
         }
     }
-    let require_circular = options
-        .get("--require-circular")
-        .is_some_and(|value| matches!(value.as_str(), "true" | "1" | "yes"));
     if require_circular && status != "circular" {
         return Err(format!(
             "GM2 mitochondrial assembly is {status}; a read-supported circular genome is required"
@@ -806,6 +828,51 @@ mod tests {
         // An unrelated circular sequence shares no anchor: leave it unchanged.
         let assembly = pseudo_dna(200, 99999);
         assert!(standardize_circular(&assembly, &rows, &reference).is_none());
+    }
+
+    #[test]
+    fn empty_contigs_are_a_nonfatal_adaptive_checkpoint() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "gm2_mito_empty_checkpoint_{}_{}",
+            process::id(),
+            unique
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let reference = root.join("reference.fasta");
+        let output = root.join("output");
+        fs::write(&reference, ">mitochondrion\nACGTACGTACGT\n").unwrap();
+        let mut arguments = HashMap::from([
+            ("--reference-genome".into(), reference.display().to_string()),
+            (
+                "--contigs".into(),
+                root.join("missing_contigs.fasta").display().to_string(),
+            ),
+            (
+                "--paired-reads".into(),
+                root.join("missing_reads.fq").display().to_string(),
+            ),
+            ("--out-dir".into(), output.display().to_string()),
+            ("--require-circular".into(), "false".into()),
+        ]);
+        finalize(&arguments).unwrap();
+        assert_eq!(
+            fs::read_to_string(output.join("mitochondrial_assembly_summary.tsv")).unwrap(),
+            "status\tno_contigs\nresolution_reason\tno_assembled_contigs\ncomponent_count\t0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(output.join("mitochondrial_assembly.fasta")).unwrap(),
+            ""
+        );
+
+        arguments.insert("--require-circular".into(), "true".into());
+        assert!(finalize(&arguments)
+            .unwrap_err()
+            .contains("assembly is no_contigs"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

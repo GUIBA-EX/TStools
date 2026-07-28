@@ -48,7 +48,7 @@ GenBank gene/rRNA/tRNA + genome/tile baits
 ## 常用与专家参数
 
 - `--mito-genbank`：必需；带注释的线粒体 GenBank 参考。
-- `--mito-max-reads 320`：自适应流程最大约 1.05M paired-read blocks；连续两个阶段产生严格一致的闭环（忽略切点和链方向）时提前停止。稳定性按样本各自判定：某样本在连续两个深度观测一致即被冻结，后续更深阶段不再对其招募或重组装，因此混合 cohort 只让仍在变化的样本承担更深的读数预算。
+- `--mito-max-reads 320`：自适应流程最大约 1.05M paired-read blocks；连续两个阶段产生严格一致的闭环（忽略切点和链方向）时提前停止。稳定性按样本各自判定：某样本只有在连续两个深度得到相同的已验证闭环时才被冻结；未成环（包括尚无 contig）只是检查点状态，会继续增加 reads 直至成环或达到上限。因此混合 cohort 只让尚未确认稳定闭环的样本承担更深的读数预算。
 - `--no-mito-adaptive-stop`：关闭分阶段早停，改用普通 `--max-reads` 的一次性过滤。
 
 以下为隐藏的专家覆盖参数，仅在明确诊断招募、图连接或闭环失败时调整：`--mito-min-overlap`、`--mito-min-overlap-identity`、`--mito-terminal-window`、`--mito-link-kmer`、`--mito-min-link-hits`、`--mito-min-pair-support`、`--mito-bridge-kmer`、`--mito-bridge-min-depth`、`--mito-max-bridge`、`--mito-min-junction-support`。

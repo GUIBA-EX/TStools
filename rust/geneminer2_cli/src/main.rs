@@ -3280,32 +3280,43 @@ fn execute_mito_single_stage(
                     fs::remove_dir_all(&rescue_stage_root).map_err(|e| e.to_string())?;
                 }
                 let rescue_ref_dir = rescue_stage_root.join("assembly_refs");
-                let rescue_reference =
-                    build_mito_rescue_reference(&reference, &sample_dir, &rescue_ref_dir)?;
+                let Some(rescue_reference) =
+                    build_mito_rescue_reference(&reference, &sample_dir, &rescue_ref_dir)?
+                else {
+                    // No contig means this adaptive depth simply lacks enough
+                    // evidence for rescue. Keep its no_contigs observation and
+                    // let the scheduler advance to the next read checkpoint.
+                    // A one-pass run still requires a circle and must fail.
+                    return if require_circular {
+                        finalize_mito_sample(&stage_opt, &bins, &reference, &sample_dir, true)
+                    } else {
+                        Ok(())
+                    };
+                };
                 let backup = staged.join(".mito_seed_backups").join(&sample.name);
                 if backup.exists() {
                     fs::remove_dir_all(&backup).map_err(|e| e.to_string())?;
                 }
                 move_tree(&sample_dir, &backup)?;
-                let rescue_result = rescue_reference.map_or(Ok(()), |rescue| {
+                let rescue_result = (|| {
                     let rescue_dict = rescue_stage_root.join("filter.dict");
                     build_mito_dictionary(
                         &stage_opt,
                         &bins,
-                        &rescue,
+                        &rescue_reference,
                         &rescue_dict,
                         &rescue_stage_root,
                     )?;
                     mito_recruit_refilter_assemble(
                         &stage_opt,
                         &bins,
-                        &rescue,
+                        &rescue_reference,
                         &sample,
                         &sample_dir,
                         &rescue_dict,
                         max_reads,
                     )
-                });
+                })();
                 if rescue_result.is_err() {
                     if sample_dir.exists() {
                         fs::remove_dir_all(&sample_dir).map_err(|e| e.to_string())?;
@@ -3683,6 +3694,10 @@ fn status_line(observations: &std::collections::BTreeMap<String, (String, String
         .join(", ")
 }
 
+fn is_stable_circular(previous: Option<&(String, String)>, observation: &(String, String)) -> bool {
+    observation.0 == "circular" && previous == Some(observation)
+}
+
 fn execute_mito(opt: &Options, bins: &Path, samples: &[Sample]) -> Result<(), String> {
     if opt.commands != ["mito"] {
         return Err(
@@ -3723,12 +3738,10 @@ fn execute_mito(opt: &Options, bins: &Path, samples: &[Sample]) -> Result<(), St
         );
     }
     let stages = root.join(".mito_adaptive");
-    // `previous` holds each still-changing sample's observation from the prior
-    // depth; `settled` holds the final observation of samples that have stopped
-    // changing. Recruited mitochondrial coverage saturates quickly and samples
-    // reach a stable assembly at different depths, so once a sample matches its
-    // own previous observation it is frozen and never recruited or reassembled
-    // again — only the samples that are still moving pay for deeper stages.
+    // `previous` holds each sample's observation from the prior depth; `settled`
+    // holds only verified circles that were identical at two consecutive
+    // checkpoints. A partial or no-contig observation is never an early-stop
+    // condition: it remains pending and receives the next, larger read budget.
     let mut previous: std::collections::BTreeMap<String, (String, String)> =
         std::collections::BTreeMap::new();
     let mut settled: std::collections::BTreeMap<String, (String, String)> =
@@ -3769,9 +3782,10 @@ fn execute_mito(opt: &Options, bins: &Path, samples: &[Sample]) -> Result<(), St
         )?;
         for sample in &pending {
             let observation = mito_observation(&stage.join(&sample.name))?;
-            // Two consecutive identical observations mean adding reads no longer
-            // changes this sample: freeze its result and stop reprocessing it.
-            if previous.get(&sample.name) == Some(&observation) {
+            // Only the same verified circle at two consecutive checkpoints is
+            // stable enough to freeze. Identical non-circular results must keep
+            // advancing through the adaptive read budgets.
+            if is_stable_circular(previous.get(&sample.name), &observation) {
                 freeze_sample(&stage, &mut settled, &sample.name, observation)?;
             } else {
                 previous.insert(sample.name.clone(), observation);
@@ -3779,15 +3793,9 @@ fn execute_mito(opt: &Options, bins: &Path, samples: &[Sample]) -> Result<(), St
         }
         let reached_max = limit >= maximum;
         if settled.len() == samples.len() {
-            // Every sample stabilised across two consecutive depths. A stabilised
-            // circular assembly is confirmed; a stabilised non-circular one is a
-            // preserved partial. This is the only path that can succeed.
-            let statuses = status_line(&settled);
-            return if settled.values().all(|(status, _)| status == "circular") {
-                Ok(())
-            } else {
-                Err(format!("mito adaptive stop reached a stable non-circular assembly; preserved the final partial result ({statuses})"))
-            };
+            // Every sample produced the same verified circle at two consecutive
+            // depths, so the cohort can stop before the maximum read budget.
+            return Ok(());
         }
         if reached_max {
             // The read budget is spent with at least one sample still changing:
@@ -6193,6 +6201,17 @@ mod tests {
         );
         assert_eq!(parse_cpu_list("3-1"), None);
         assert_eq!(parse_cpu_list(""), None);
+    }
+
+    #[test]
+    fn adaptive_mito_only_settles_identical_circular_observations() {
+        let partial = ("linear_single_contig".into(), "same-sequence".into());
+        let empty = ("no_contigs".into(), String::new());
+        let circular = ("circular".into(), "canonical-circle".into());
+        assert!(!is_stable_circular(Some(&partial), &partial));
+        assert!(!is_stable_circular(Some(&empty), &empty));
+        assert!(!is_stable_circular(None, &circular));
+        assert!(is_stable_circular(Some(&circular), &circular));
     }
 
     #[test]
