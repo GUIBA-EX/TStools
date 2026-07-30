@@ -48,7 +48,7 @@ A circular result must have one component, no `N`, every join supported by a str
 ## Common and expert parameters
 
 - `--mito-genbank`: required annotated mitochondrial GenBank reference.
-- `--mito-max-reads 320`: at most approximately 1.05M paired-read blocks per adaptive stage; the workflow stops early when two successive stages return an exactly identical circular sequence after cut/strand normalization. Stability is judged per sample: a sample whose observation is unchanged across two consecutive depths is frozen and no longer recruited or reassembled at deeper stages, so a mixed cohort only pays the deeper read budget on the samples that are still changing.
+- `--mito-max-reads 320`: at most approximately 1.05M paired-read blocks per adaptive stage; the workflow stops early when two successive stages return an exactly identical circular sequence after cut/strand normalization. Stability is judged per sample: a sample is frozen only after the same verified circle is observed at two consecutive depths. A non-circular result (including no contig yet) is only a checkpoint and continues to deeper read budgets until a circle is confirmed or the maximum is reached.
 - `--no-mito-adaptive-stop`: disable staged early stopping and use the normal one-pass `--max-reads` behaviour.
 
 The following hidden expert overrides should be changed only to diagnose a known recruitment, graph-joining, or circularity problem: `--mito-min-overlap`, `--mito-min-overlap-identity`, `--mito-terminal-window`, `--mito-link-kmer`, `--mito-min-link-hits`, `--mito-min-pair-support`, `--mito-bridge-kmer`, `--mito-bridge-min-depth`, `--mito-max-bridge`, and `--mito-min-junction-support`.
