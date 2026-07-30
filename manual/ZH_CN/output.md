@@ -36,7 +36,7 @@
 
 **uce_rescue_summary.csv**：使用 `--assembly-mode uce --uce-rescue-reads` 时生成的单样本首轮至最终结果摘要。
 
-**uce_rescue_rounds.csv**：逐轮、逐 locus 记录 active/revert/terminal-side 决策、长度和 unique-read 增量；第二轮还记录左右新增长度、breadth、最大 gap、fragment 数、跨旧 core 边界 fragment 数及是否接受。
+**uce_rescue_rounds.csv**：逐轮、逐 locus 记录 active/revert/terminal-side 决策、长度和 unique-read 增量；第二轮还记录左右新增长度、breadth、最大 gap、fragment 数、跨旧 core 边界 fragment 数及是否接受。`reverted_inverted_repeat` 表示该轮新引入达到当前阈值的精确倒置重复；`reverted_unsupported_internal_gap` 表示 rescue 新引入至少 40 bp、没有同一条 read 上连贯 k-mer 链支持的内部区间。两种状态都会逐 locus 恢复该轮备份。
 
 **assembly_graphs**：仅在使用 `--assembler-graph-format gfa`、`dot` 或 `both` 时生成的逐 locus 压缩组装图；默认不生成。
 

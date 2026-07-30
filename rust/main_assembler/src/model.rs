@@ -37,6 +37,7 @@ pub struct Args {
     pub side_candidates: usize,
     pub path_strategy: PathStrategy,
     pub backbone_lookahead: usize,
+    pub reverse_reuse_reference_scale: f64,
     pub max_contig_length: usize,
     pub min_read_density: f64,
     pub density_check_min_length: usize,

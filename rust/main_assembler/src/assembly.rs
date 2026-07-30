@@ -418,9 +418,9 @@ pub fn add_pe_branch_support(
         }
         let read_kmers = |sequence: &[u8]| {
             let mut kmers = Vec::new();
-            for (_, run) in valid_runs(sequence) {
+            for (run_start, run) in valid_runs(sequence) {
                 for_each_kmer(run, k, |offset, forward, reverse| {
-                    kmers.push((offset, forward, reverse));
+                    kmers.push((run_start + offset, forward, reverse));
                 });
             }
             kmers
@@ -456,14 +456,17 @@ pub fn add_pe_branch_support(
 }
 
 // 从当前 k-mer 找能接上的下一跳，再按证据排个先后。
+#[allow(clippy::too_many_arguments)]
 fn outgoing(
     graph: &HashMap<u128, KmerInfo>,
     current: u128,
     k: usize,
     blocked: &HashSet<u128>,
+    reverse_reuse_guard: &HashSet<u128>,
     discarded: Option<&HashSet<u128>>,
     reference_tie_break: bool,
     branch_support: Option<&BranchSupport>,
+    reverse_reuse_reference_scale: f64,
 ) -> Vec<Node> {
     let suffix_mask = kmer_mask(k - 1);
     let prefix = (current & suffix_mask) << 2;
@@ -475,10 +478,18 @@ fn outgoing(
             continue;
         }
         if let Some(value) = graph.get(&candidate) {
+            let reverse = reverse_complement_kmer(candidate, k);
+            let reverse_reuse =
+                blocked.contains(&reverse) || reverse_reuse_guard.contains(&reverse);
+            let reference_weight = if reverse_reuse {
+                (value.reference_weight as f64 * reverse_reuse_reference_scale).round() as i64
+            } else {
+                value.reference_weight
+            };
             nodes.push(Node {
                 kmer: candidate,
                 position: value.position,
-                weight: value.depth + value.reference_weight,
+                weight: value.depth + reference_weight,
                 pe_support: branch_support
                     .and_then(|support| support.get(&(current, candidate)).copied())
                     .unwrap_or(0),
@@ -533,6 +544,7 @@ fn outgoing(
     nodes
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn walk_backbone(
     graph: &HashMap<u128, KmerInfo>,
     seed: u128,
@@ -540,6 +552,8 @@ pub fn walk_backbone(
     iteration: usize,
     lookahead: usize,
     branch_support: Option<&BranchSupport>,
+    reverse_reuse_guard: &HashSet<u128>,
+    reverse_reuse_reference_scale: f64,
 ) -> (Vec<PathContig>, HashSet<u128>, Vec<i32>, i64) {
     // UCE 默认就认一条最靠谱的主干，岔路看几步再定，别在气泡里来回磨叽。
     let lookahead = lookahead.max(1);
@@ -555,14 +569,15 @@ pub fn walk_backbone(
             *path.last().expect("seed"),
             k,
             &visited,
+            reverse_reuse_guard,
             Some(&discarded),
             true,
             branch_support,
+            reverse_reuse_reference_scale,
         );
         if nodes.is_empty() {
             break;
         }
-
         let chosen = if nodes.len() == 1 {
             nodes[0]
         } else {
@@ -581,9 +596,11 @@ pub fn walk_backbone(
                         node.kmer,
                         k,
                         &trace_seen,
+                        reverse_reuse_guard,
                         Some(&discarded),
                         true,
                         branch_support,
+                        reverse_reuse_reference_scale,
                     );
                     let Some(next) = following.first() else {
                         break;
@@ -623,9 +640,11 @@ pub fn walk_backbone(
                 *path.last().expect("path"),
                 k,
                 &visited,
+                reverse_reuse_guard,
                 Some(&discarded),
                 true,
                 branch_support,
+                reverse_reuse_reference_scale,
             );
             if linear.len() != 1 || path.len() > iteration {
                 break;
@@ -648,6 +667,8 @@ pub fn walk_search(
     seed: u128,
     k: usize,
     mut iteration: usize,
+    reverse_reuse_guard: &HashSet<u128>,
+    reverse_reuse_reference_scale: f64,
 ) -> (Vec<PathContig>, HashSet<u128>, Vec<i32>, i64) {
     // 兼容旧策略：遇岔路就压栈回溯，多找几条候选，不是 UCE 默认路子。
     let mut path = vec![seed];
@@ -666,9 +687,11 @@ pub fn walk_search(
             *path.last().expect("seed"),
             k,
             &path_set,
+            reverse_reuse_guard,
             None,
             false,
             None,
+            reverse_reuse_reference_scale,
         );
         if nodes.is_empty() {
             iteration -= 1;
@@ -952,6 +975,7 @@ pub fn assemble_seed(
 ) -> (Vec<ContigRecord>, HashSet<u128>, i32) {
     // 从一个 seed 往两边接，组装成候选 contig；成不成得靠后面的证据说话。
     let reverse_seed = reverse_complement_kmer(seed, k);
+    let empty_reverse_reuse_guard = HashSet::new();
     let (right_paths, right_kmers, right_positions, right_weight) = if args.assembly_mode
         == AssemblyMode::Uce
         && args.path_strategy == PathStrategy::Backbone
@@ -963,9 +987,18 @@ pub fn assemble_seed(
             args.iteration,
             args.backbone_lookahead,
             branch_support,
+            &empty_reverse_reuse_guard,
+            args.reverse_reuse_reference_scale,
         )
     } else {
-        walk_search(graph, seed, k, args.iteration)
+        walk_search(
+            graph,
+            seed,
+            k,
+            args.iteration,
+            &empty_reverse_reuse_guard,
+            args.reverse_reuse_reference_scale,
+        )
     };
     let (left_paths, left_kmers, left_positions, left_weight) = if args.assembly_mode
         == AssemblyMode::Uce
@@ -978,9 +1011,18 @@ pub fn assemble_seed(
             args.iteration,
             args.backbone_lookahead,
             branch_support,
+            &right_kmers,
+            args.reverse_reuse_reference_scale,
         )
     } else {
-        walk_search(graph, reverse_seed, k, args.iteration)
+        walk_search(
+            graph,
+            reverse_seed,
+            k,
+            args.iteration,
+            &right_kmers,
+            args.reverse_reuse_reference_scale,
+        )
     };
 
     let mut positions: Vec<i64> = right_positions
@@ -1219,7 +1261,8 @@ mod tests {
             .map(|(sequence, depth)| (encode_kmer(sequence.as_bytes()).unwrap(), info(depth)))
             .collect();
         let seed = encode_kmer(b"AAAA").unwrap();
-        let (paths, visited, _, _) = walk_backbone(&graph, seed, k, 100, 24, None);
+        let (paths, visited, _, _) =
+            walk_backbone(&graph, seed, k, 100, 24, None, &HashSet::new(), 1.0);
         let extension: Vec<u8> = paths[0].bases.iter().map(|base| bits_base(*base)).collect();
         assert_eq!(extension, b"CGTTT");
         assert!(visited.contains(&encode_kmer(b"AAAC").unwrap()));
@@ -1233,10 +1276,12 @@ mod tests {
             .map(|sequence| (encode_kmer(sequence.as_bytes()).unwrap(), info(5)))
             .collect();
         let seed = encode_kmer(b"AAA").unwrap();
-        let (paths, visited, _, _) = walk_backbone(&graph, seed, 3, 100, 24, None);
+        let (paths, visited, _, _) =
+            walk_backbone(&graph, seed, 3, 100, 24, None, &HashSet::new(), 1.0);
         assert_eq!(paths[0].bases.len(), 3);
         assert_eq!(visited.len(), 4);
     }
+
     #[test]
     fn pe_fragment_support_keeps_only_independently_supported_low_depth_kmers() {
         let mut reference = HashMap::new();
@@ -1288,13 +1333,64 @@ mod tests {
         let blocked = HashSet::from([current]);
 
         assert_eq!(
-            outgoing(&graph, current, 3, &blocked, None, false, None)[0].kmer,
+            outgoing(
+                &graph,
+                current,
+                3,
+                &blocked,
+                &HashSet::new(),
+                None,
+                false,
+                None,
+                1.0
+            )[0]
+            .kmer,
             standard
         );
         let support = HashMap::from([((current, pe_supported), 2)]);
         assert_eq!(
-            outgoing(&graph, current, 3, &blocked, None, false, Some(&support))[0].kmer,
+            outgoing(
+                &graph,
+                current,
+                3,
+                &blocked,
+                &HashSet::new(),
+                None,
+                false,
+                Some(&support),
+                1.0
+            )[0]
+            .kmer,
             pe_supported
+        );
+    }
+
+    #[test]
+    fn reverse_reuse_scales_reference_bonus_but_keeps_read_depth() {
+        let current = encode_kmer(b"AAC").unwrap();
+        let reverse_reused = encode_kmer(b"ACA").unwrap();
+        let fresh = encode_kmer(b"ACC").unwrap();
+        let mut graph = HashMap::new();
+        graph.insert(current, info(5));
+        let mut previous_path = info(2);
+        previous_path.reference_weight = 80;
+        graph.insert(reverse_reused, previous_path);
+        graph.insert(fresh, info(30));
+        let blocked = HashSet::from([current]);
+        let other_arm = HashSet::from([reverse_complement_kmer(reverse_reused, 3)]);
+
+        assert_eq!(
+            outgoing(&graph, current, 3, &blocked, &other_arm, None, false, None, 1.0)[0].kmer,
+            reverse_reused
+        );
+        assert_eq!(
+            outgoing(&graph, current, 3, &blocked, &other_arm, None, false, None, 0.25)[0].kmer,
+            fresh
+        );
+        graph.get_mut(&reverse_reused).unwrap().depth = 50;
+        assert_eq!(
+            outgoing(&graph, current, 3, &blocked, &other_arm, None, false, None, 0.25)[0].kmer,
+            reverse_reused
         );
     }
 

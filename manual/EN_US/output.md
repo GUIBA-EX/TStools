@@ -36,7 +36,7 @@ Each sample listed in the input table gets a folder under the output directory.
 
 **uce_rescue_summary.csv**: Per-sample first-to-final rescue summary generated when `--assembly-mode uce --uce-rescue-reads` is used.
 
-**uce_rescue_rounds.csv**: Per-round, per-locus active/revert/terminal-side decisions plus length and unique-read deltas. Round two also reports each side's added length, breadth, largest gap, fragment count, core-boundary bridge count, and acceptance decision.
+**uce_rescue_rounds.csv**: Per-round, per-locus active/revert/terminal-side decisions plus length and unique-read deltas. Round two also reports each side's added length, breadth, largest gap, fragment count, core-boundary bridge count, and acceptance decision. `reverted_inverted_repeat` means that the round newly introduced an exact inverted repeat meeting the configured length threshold. `reverted_unsupported_internal_gap` means that rescue newly introduced an internal interval of at least 40 bp without a coherent read chain. Either status restores that locus from its round backup.
 
 **assembly_graphs**: Per-locus compact assembly graphs generated only with `--assembler-graph-format gfa`, `dot`, or `both`; no graphs are written by default.
 
