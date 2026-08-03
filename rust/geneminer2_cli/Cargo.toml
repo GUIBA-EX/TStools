@@ -8,3 +8,4 @@ default-run = "geneminer2_cli"
 
 [dependencies]
 sha2 = "0.10"
+uce_filter_core = { path = "../uce_filter_core" }

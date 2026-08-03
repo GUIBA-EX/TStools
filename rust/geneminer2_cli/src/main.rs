@@ -3,9 +3,10 @@
 //! The public CLI is implemented in Rust and does not require a Python runtime.
 
 mod rescue_qc;
+mod uce_recruit;
 
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Read};
@@ -17,6 +18,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Instant;
+use uce_recruit::RecruitPass;
 
 const UCE_RESCUE_ASSEMBLY_KMER: &str = "21";
 const UCE_TERMINAL_MIN_EXTENSION: usize = 30;
@@ -106,6 +108,12 @@ const VALUE_OPTIONS: &[&str] = &[
     "--uce-shadow-per-locus",
     "--uce-shadow-band",
     "--uce-shadow-terminal-window",
+    "--uce-recruit-mode",
+    "--uce-fallback-kmer-size",
+    "--uce-fallback-step",
+    "--uce-fallback-verify-kmer-size",
+    "--uce-fallback-min-alignment-overlap",
+    "--uce-fallback-min-alignment-identity",
     "--te-stage",
     "--te-kmer",
     "--te-min-kmer-count",
@@ -283,6 +291,12 @@ struct Options {
     shadow_per_locus: String,
     shadow_band: String,
     shadow_terminal_window: String,
+    uce_recruit_mode: String,
+    uce_fallback_kmer_size: String,
+    uce_fallback_step: String,
+    uce_fallback_verify_kmer_size: String,
+    uce_fallback_min_alignment_overlap: String,
+    uce_fallback_min_alignment_identity: String,
     uce_memory_limit_mib: u64,
     rescue: bool,
     stats_count_input_reads: bool,
@@ -386,6 +400,56 @@ fn parse(args: &[String]) -> Result<Options, String> {
         return Err("--log-format must be text or json".into());
     }
     let (workers, worker_source) = resolve_worker_budget(&value(args, &["-p"], "auto")?)?;
+    let uce_recruit_mode = value(args, &["--uce-recruit-mode"], "fast")?;
+    if !matches!(uce_recruit_mode.as_str(), "fast" | "auto") {
+        return Err("--uce-recruit-mode must be fast or auto".into());
+    }
+    if uce_recruit_mode == "auto" && assembly_mode != "uce" {
+        return Err("--uce-recruit-mode auto requires --assembly-mode uce".into());
+    }
+    let uce_fallback_kmer_size = value(args, &["--uce-fallback-kmer-size"], "21")?;
+    let uce_fallback_step = value(args, &["--uce-fallback-step"], "1")?;
+    let uce_fallback_verify_kmer_size = value(args, &["--uce-fallback-verify-kmer-size"], "19")?;
+    let uce_fallback_min_alignment_overlap =
+        value(args, &["--uce-fallback-min-alignment-overlap"], "45")?;
+    let uce_fallback_min_alignment_identity =
+        value(args, &["--uce-fallback-min-alignment-identity"], "0.80")?;
+    for (name, raw) in [
+        ("--uce-fallback-kmer-size", &uce_fallback_kmer_size),
+        (
+            "--uce-fallback-verify-kmer-size",
+            &uce_fallback_verify_kmer_size,
+        ),
+    ] {
+        let parsed = raw
+            .parse::<usize>()
+            .map_err(|_| format!("{name} must be an integer in 1..=64"))?;
+        if !(1..=64).contains(&parsed) {
+            return Err(format!("{name} must be an integer in 1..=64"));
+        }
+    }
+    if uce_fallback_step
+        .parse::<usize>()
+        .ok()
+        .is_none_or(|step| step == 0)
+    {
+        return Err("--uce-fallback-step must be a positive integer".into());
+    }
+    if uce_fallback_min_alignment_overlap.parse::<usize>().is_err() {
+        return Err("--uce-fallback-min-alignment-overlap must be a non-negative integer".into());
+    }
+    let fallback_alignment_identity = uce_fallback_min_alignment_identity
+        .parse::<f64>()
+        .map_err(|_| "--uce-fallback-min-alignment-identity must be in 0..=1")?;
+    if !fallback_alignment_identity.is_finite()
+        || !(0.0..=1.0).contains(&fallback_alignment_identity)
+    {
+        return Err("--uce-fallback-min-alignment-identity must be in 0..=1".into());
+    }
+    let legacy_uce_filter = flag(args, "--legacy-uce-filter")?;
+    if legacy_uce_filter && uce_recruit_mode == "auto" {
+        return Err("--uce-recruit-mode auto is unavailable with --legacy-uce-filter".into());
+    }
     if commands == ["gene"] {
         commands = vec![
             "filter".into(),
@@ -458,6 +522,12 @@ fn parse(args: &[String]) -> Result<Options, String> {
         shadow_per_locus: value(args, &["--uce-shadow-per-locus"], "64")?,
         shadow_band: value(args, &["--uce-shadow-band"], "32")?,
         shadow_terminal_window: value(args, &["--uce-shadow-terminal-window"], "150")?,
+        uce_recruit_mode,
+        uce_fallback_kmer_size,
+        uce_fallback_step,
+        uce_fallback_verify_kmer_size,
+        uce_fallback_min_alignment_overlap,
+        uce_fallback_min_alignment_identity,
         uce_memory_limit_mib: 0,
         rescue: flag(args, "--uce-rescue-reads")?,
         stats_count_input_reads: flag(args, "--stats-count-input-reads")?,
@@ -465,7 +535,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         cleanup_intermediates: flag(args, "--cleanup-intermediates")?,
         cleanup_dry_run: flag(args, "--cleanup-dry-run")?,
         reuse_reference_cache: flag(args, "--reuse-reference-cache")?,
-        legacy_uce_filter: flag(args, "--legacy-uce-filter")?,
+        legacy_uce_filter,
         workflow_profile: flag(args, "--workflow-profile")?,
         resume: flag(args, "--resume")?,
         log_format,
@@ -647,19 +717,25 @@ fn soft_boundary(value: &str) -> Result<String, String> {
     }
 }
 
-fn uce_filter_args_for_recruit(
+struct UceRecruitInvocation<'a> {
+    sample_dir: &'a Path,
+    verify_reference: &'a Path,
+    recruit_reference: &'a Path,
+    role: &'a str,
+    retain_loci_file: Option<&'a Path>,
+}
+
+fn uce_filter_args_for_pass(
     opt: &Options,
     sample: &Sample,
-    sample_dir: &Path,
-    verify_reference: &Path,
-    recruit_reference: &Path,
-    role: &str,
+    pass: &RecruitPass,
+    invocation: &UceRecruitInvocation<'_>,
 ) -> Vec<String> {
     let mut args = vec![
         "-r".into(),
-        verify_reference.display().to_string(),
+        invocation.verify_reference.display().to_string(),
         "--recruit-references".into(),
-        recruit_reference.display().to_string(),
+        invocation.recruit_reference.display().to_string(),
         "-q1".into(),
         sample.read1.clone(),
     ];
@@ -668,15 +744,15 @@ fn uce_filter_args_for_recruit(
     }
     args.extend([
         "-o".into(),
-        sample_dir.display().to_string(),
+        invocation.sample_dir.display().to_string(),
         "-kf".into(),
-        opt.kf.clone(),
+        pass.kmer_size.clone(),
         "-s".into(),
-        opt.step.clone(),
+        pass.step.clone(),
         "--selection".into(),
         "auto".into(),
         "--reference-role".into(),
-        role.into(),
+        invocation.role.into(),
         "--threads".into(),
         "1".into(),
         "--memory-limit-mib".into(),
@@ -688,6 +764,27 @@ fn uce_filter_args_for_recruit(
         "--max-size".into(),
         opt.size_limit.clone(),
     ]);
+    if let Some(verify_kmer_size) = &pass.verify_kmer_size {
+        args.extend(["--verification-kmer-size".into(), verify_kmer_size.clone()]);
+    }
+    if let Some(minimum_overlap) = &pass.minimum_alignment_overlap {
+        args.extend([
+            "--minimum-alignment-overlap".into(),
+            minimum_overlap.clone(),
+        ]);
+    }
+    if let Some(minimum_identity) = &pass.minimum_alignment_identity {
+        args.extend([
+            "--minimum-alignment-identity".into(),
+            minimum_identity.clone(),
+        ]);
+    }
+    if pass.max_locus_count > 0 {
+        args.extend(["--max-locus-count".into(), pass.max_locus_count.to_string()]);
+    }
+    if let Some(path) = invocation.retain_loci_file {
+        args.extend(["--retain-loci-file".into(), path.display().to_string()]);
+    }
     if opt.max_reads != "0" {
         args.extend(["--max-fragments".into(), opt.max_reads.clone()]);
     }
@@ -703,6 +800,28 @@ fn uce_filter_args_for_recruit(
         ]);
     }
     args
+}
+
+fn uce_filter_args_for_recruit(
+    opt: &Options,
+    sample: &Sample,
+    sample_dir: &Path,
+    verify_reference: &Path,
+    recruit_reference: &Path,
+    role: &str,
+) -> Vec<String> {
+    uce_filter_args_for_pass(
+        opt,
+        sample,
+        &RecruitPass::fast(&opt.kf, &opt.step),
+        &UceRecruitInvocation {
+            sample_dir,
+            verify_reference,
+            recruit_reference,
+            role,
+            retain_loci_file: None,
+        },
+    )
 }
 
 fn uce_filter_args_for(
@@ -2075,6 +2194,9 @@ fn execute_uce(
             "uce_filter",
             &args,
         )?;
+        if opt.uce_recruit_mode == "auto" {
+            execute_uce_auto_recruit(opt, bins, sample, profile, &sample_dir, filter_threads)?;
+        }
     }
     if opt.commands.iter().any(|c| c == "assemble") {
         let args = uce_assembler_args(opt, &sample_dir, assembler_threads)?;
@@ -2088,6 +2210,21 @@ fn execute_uce(
             "main_assembler-rust",
             &args,
         )?;
+        if opt.uce_recruit_mode == "auto" {
+            let started = Instant::now();
+            let input_bytes = profile_path_size(&sample_dir.join("results"));
+            let result = execute_uce_fallback_probe_gate(opt, &sample_dir);
+            record_profile_stage(
+                profile,
+                sample,
+                "fallback-probe-gate",
+                started,
+                input_bytes,
+                &sample_dir,
+                &result,
+            );
+            result?;
+        }
         if opt.rescue {
             let rescue_input_bytes = profile_path_size(&sample_dir);
             let started = Instant::now();
@@ -2104,6 +2241,200 @@ fn execute_uce(
             result?;
         }
     }
+    Ok(())
+}
+
+fn archive_fallback_probe_rejected(sample_dir: &Path, locus: &str) -> Result<(), String> {
+    let archive = sample_dir.join("fallback_probe_rejected");
+    for directory in ["results", "contigs_all", "contigs_all_low"] {
+        let source = sample_dir.join(directory).join(format!("{locus}.fasta"));
+        if !source.is_file() {
+            continue;
+        }
+        let destination_dir = archive.join(directory);
+        fs::create_dir_all(&destination_dir).map_err(|error| error.to_string())?;
+        let destination = destination_dir.join(format!("{locus}.fasta"));
+        if destination.exists() {
+            return Err(format!(
+                "refusing to overwrite archived UCE fallback candidate '{}'",
+                destination.display()
+            ));
+        }
+        fs::rename(&source, &destination).map_err(|error| {
+            format!(
+                "Unable to archive rejected UCE fallback candidate '{}' as '{}': {error}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn execute_uce_fallback_probe_gate(opt: &Options, sample_dir: &Path) -> Result<(), String> {
+    let recruit_audit = sample_dir.join("uce_recruit_passes.tsv");
+    let fallback_loci = uce_recruit::fallback_recruited_loci(&recruit_audit)?;
+    let mut summary = read_uce_summary(&sample_dir.join("uce_assembly_summary.csv"))?;
+    let mut contigs = BTreeMap::new();
+    for locus in &fallback_loci {
+        if !uce_row_accepted(summary.rows.get(locus)) {
+            continue;
+        }
+        let path = sample_dir.join("results").join(format!("{locus}.fasta"));
+        let Some(sequence) = first_fasta_sequence(&path)? else {
+            continue;
+        };
+        contigs.insert(locus.clone(), sequence);
+    }
+    let evidence = uce_recruit::evaluate_contig_probe_support(Path::new(&opt.reference), &contigs)?;
+    uce_recruit::write_contig_probe_audit(
+        &sample_dir.join("uce_recruit_contig_probe_gate.tsv"),
+        &evidence,
+    )?;
+    for field in ["auto_recruit_probe_gate", "auto_recruit_probe_gate_reason"] {
+        if !summary.headers.iter().any(|header| header == field) {
+            summary.headers.push(field.to_owned());
+        }
+    }
+    let mut accepted = 0_usize;
+    let mut rejected = 0_usize;
+    for row in &evidence {
+        let summary_row = summary.rows.get_mut(&row.locus).ok_or_else(|| {
+            format!(
+                "UCE fallback probe gate has no assembly summary row for '{}'",
+                row.locus
+            )
+        })?;
+        summary_row.insert(
+            "auto_recruit_probe_gate".into(),
+            if row.accepted { "pass" } else { "reject" }.into(),
+        );
+        summary_row.insert("auto_recruit_probe_gate_reason".into(), row.reason.into());
+        if row.accepted {
+            accepted += 1;
+            continue;
+        }
+        rejected += 1;
+        summary_row.insert("accepted".into(), "0".into());
+        summary_row.insert("low_quality".into(), "1".into());
+        summary_row.insert("status".into(), "fallback_probe_gate_rejected".into());
+        archive_fallback_probe_rejected(sample_dir, &row.locus)?;
+    }
+    write_uce_summary(&sample_dir.join("uce_assembly_summary.csv"), &summary)?;
+    write_result_dict_from_uce_summary(sample_dir, &summary)?;
+    eprintln!(
+        "UCE auto fallback contig probe gate: {} accepted, {} rejected, {} recruited loci had no accepted contig",
+        accepted,
+        rejected,
+        fallback_loci.len().saturating_sub(evidence.len()),
+    );
+    Ok(())
+}
+
+fn execute_uce_auto_recruit(
+    opt: &Options,
+    bins: &Path,
+    sample: &Sample,
+    profile: Option<&WorkflowProfile>,
+    sample_dir: &Path,
+    filter_threads: usize,
+) -> Result<(), String> {
+    let summary_path = sample_dir.join("uce_filter_summary.tsv");
+    let fast_selected = uce_recruit::read_selected_fragments(&summary_path)?;
+    let unresolved = uce_recruit::unresolved_loci(&fast_selected);
+    let fast_pass = RecruitPass::fast(&opt.kf, &opt.step);
+    let fallback_pass = RecruitPass::fallback(
+        &opt.uce_fallback_kmer_size,
+        &opt.uce_fallback_step,
+        &opt.uce_fallback_verify_kmer_size,
+        &opt.uce_fallback_min_alignment_overlap,
+        &opt.uce_fallback_min_alignment_identity,
+    );
+    uce_recruit::preserve_summary(
+        &summary_path,
+        &sample_dir.join("uce_filter_summary.fast.tsv"),
+    )?;
+    if unresolved.is_empty() {
+        uce_recruit::write_recruit_audit(
+            &sample_dir.join("uce_recruit_passes.tsv"),
+            &fast_pass,
+            &fallback_pass,
+            &fast_selected,
+            &BTreeMap::new(),
+            &unresolved,
+            &BTreeSet::new(),
+        )?;
+        return Ok(());
+    }
+
+    let auto_root = sample_dir.join(".uce_recruit_auto");
+    if auto_root.exists() {
+        fs::remove_dir_all(&auto_root).map_err(|error| error.to_string())?;
+    }
+    fs::create_dir_all(&auto_root).map_err(|error| error.to_string())?;
+    let retain_loci_file = auto_root.join("unresolved_loci.txt");
+    uce_recruit::write_locus_allowlist(&retain_loci_file, &unresolved)?;
+    let recruit_reference = auto_root.join("recruit_references");
+    uce_recruit::materialize_recruit_reference_subset(
+        Path::new(&opt.reference),
+        &recruit_reference,
+        &unresolved,
+    )?;
+    let fallback_dir = auto_root.join("fallback");
+    let mut args = uce_filter_args_for_pass(
+        opt,
+        sample,
+        &fallback_pass,
+        &UceRecruitInvocation {
+            sample_dir: &fallback_dir,
+            verify_reference: Path::new(&opt.reference),
+            recruit_reference: &recruit_reference,
+            role: "bait",
+            retain_loci_file: Some(&retain_loci_file),
+        },
+    );
+    let thread_index = args
+        .iter()
+        .position(|argument| argument == "--threads")
+        .expect("UCEFilter arguments include --threads");
+    args[thread_index + 1] = filter_threads.to_string();
+    run_profiled(
+        profile,
+        sample,
+        "filter-fallback",
+        Path::new(&sample.read1),
+        &fallback_dir,
+        bins,
+        "uce_filter",
+        &args,
+    )?;
+    let fallback_summary_path = fallback_dir.join("uce_filter_summary.tsv");
+    let fallback_selected = uce_recruit::read_selected_fragments(&fallback_summary_path)?;
+    let recovered = uce_recruit::merge_fallback_outputs(
+        sample_dir,
+        &fallback_dir,
+        &unresolved,
+        &fallback_selected,
+    )?;
+    uce_recruit::preserve_summary(
+        &fallback_summary_path,
+        &sample_dir.join("uce_filter_summary.fallback.tsv"),
+    )?;
+    uce_recruit::write_recruit_audit(
+        &sample_dir.join("uce_recruit_passes.tsv"),
+        &fast_pass,
+        &fallback_pass,
+        &fast_selected,
+        &fallback_selected,
+        &unresolved,
+        &recovered,
+    )?;
+    fs::remove_dir_all(&auto_root).map_err(|error| error.to_string())?;
+    eprintln!(
+        "UCE auto recruit: {} unresolved fast-pass loci, {} recovered by fallback",
+        unresolved.len(),
+        recovered.len()
+    );
     Ok(())
 }
 
@@ -6360,6 +6691,21 @@ Parallelism:\n  \
 -p INT|auto  Shared CPU budget. The default is auto, which counts physical\n               \
 cores allowed by affinity/cpuset and caps them by cgroup or scheduler limits.\n               \
 Use an integer to override automatic detection.\n\n\
+UCE recruitment:\n  \
+--uce-recruit-mode fast|auto\n               \
+Use the existing single-pass k=31 recruitment (fast, default), or retry only\n               \
+fast-pass unresolved loci with the conservative sensitive pass (auto).\n  \
+--uce-fallback-kmer-size INT  Sensitive-pass recruitment k (default: 21).\n  \
+--uce-fallback-step INT       Sensitive-pass read-scan step (default: 1).\n  \
+--uce-fallback-verify-kmer-size INT\n               \
+Independent exact-match verification k (default: 19). Auto mode checks\n               \
+ambiguity against the complete probe panel and retains unique-locus reads.\n  \
+--uce-fallback-min-alignment-overlap INT\n               \
+Minimum local alignment overlap for a fallback read pair (default: 45 bp).\n  \
+--uce-fallback-min-alignment-identity FLOAT\n               \
+Minimum local alignment identity for a fallback read pair (default: 0.80).\n               \
+Fallback-only assembled contigs must be at least 200 bp, align to the target\n               \
+probe at >=80% coverage and >=80% identity, and have no near-tied panel locus.\n\n\
 UCE rescue:\n  \
 --uce-rescue-reads  Enable rescue after the initial UCE assembly.\n  \
 --uce-rescue-rounds 1|2  Number of rescue rounds (default: 2).\n  \
@@ -6462,6 +6808,138 @@ mod tests {
         assert_eq!(explicit.1, "explicit -p 12");
         assert!(resolve_worker_budget("0").is_err());
         assert!(resolve_worker_budget("physical").is_err());
+    }
+
+    #[test]
+    fn uce_recruit_defaults_to_fast_and_auto_builds_a_conservative_fallback() {
+        let base = [
+            "filter",
+            "--assembly-mode",
+            "uce",
+            "-f",
+            "samples.tsv",
+            "-r",
+            "references",
+            "-o",
+            "out",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let fast = parse(&base).unwrap();
+        assert_eq!(fast.uce_recruit_mode, "fast");
+        let sample = Sample {
+            name: "sample".into(),
+            read1: "r1.fq".into(),
+            read2: Some("r2.fq".into()),
+        };
+        let fast_args = uce_filter_args(&fast, &sample, Path::new("out/sample"), 1);
+        assert!(!fast_args
+            .iter()
+            .any(|argument| argument == "--verification-kmer-size"));
+        assert!(!fast_args
+            .iter()
+            .any(|argument| argument == "--max-locus-count"));
+        assert!(!fast_args
+            .iter()
+            .any(|argument| argument == "--retain-loci-file"));
+
+        let mut auto_args = base;
+        auto_args.extend(
+            [
+                "--uce-recruit-mode",
+                "auto",
+                "--uce-fallback-kmer-size",
+                "23",
+                "--uce-fallback-step",
+                "2",
+                "--uce-fallback-verify-kmer-size",
+                "17",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        let auto = parse(&auto_args).unwrap();
+        let pass = RecruitPass::fallback(
+            &auto.uce_fallback_kmer_size,
+            &auto.uce_fallback_step,
+            &auto.uce_fallback_verify_kmer_size,
+            &auto.uce_fallback_min_alignment_overlap,
+            &auto.uce_fallback_min_alignment_identity,
+        );
+        let fallback_args = uce_filter_args_for_pass(
+            &auto,
+            &sample,
+            &pass,
+            &UceRecruitInvocation {
+                sample_dir: Path::new("fallback"),
+                verify_reference: Path::new("references"),
+                recruit_reference: Path::new("fallback_references"),
+                role: "bait",
+                retain_loci_file: Some(Path::new("unresolved.txt")),
+            },
+        );
+        let argument_value = |name: &str| {
+            let index = fallback_args
+                .iter()
+                .position(|argument| argument == name)
+                .expect("fallback argument is present");
+            fallback_args[index + 1].as_str()
+        };
+        assert_eq!(argument_value("-kf"), "23");
+        assert_eq!(argument_value("-s"), "2");
+        assert_eq!(
+            argument_value("--recruit-references"),
+            "fallback_references"
+        );
+        assert_eq!(argument_value("--verification-kmer-size"), "17");
+        assert_eq!(argument_value("--minimum-alignment-overlap"), "45");
+        assert_eq!(argument_value("--minimum-alignment-identity"), "0.80");
+        assert_eq!(argument_value("--max-locus-count"), "1");
+        assert_eq!(argument_value("--retain-loci-file"), "unresolved.txt");
+    }
+
+    #[test]
+    fn invalid_uce_recruit_options_are_rejected() {
+        let parse_uce = |extra: &[&str]| {
+            let mut args = vec![
+                "filter".into(),
+                "--assembly-mode".into(),
+                "uce".into(),
+                "-f".into(),
+                "samples.tsv".into(),
+                "-r".into(),
+                "references".into(),
+                "-o".into(),
+                "out".into(),
+            ];
+            args.extend(extra.iter().map(|value| (*value).to_owned()));
+            parse(&args)
+        };
+        assert!(parse_uce(&["--uce-recruit-mode", "typo"]).is_err());
+        assert!(parse_uce(&[
+            "--uce-recruit-mode",
+            "auto",
+            "--uce-fallback-kmer-size",
+            "0"
+        ])
+        .is_err());
+        assert!(parse_uce(&[
+            "--uce-recruit-mode",
+            "auto",
+            "--uce-fallback-verify-kmer-size",
+            "65"
+        ])
+        .is_err());
+        assert!(parse_uce(&["--uce-recruit-mode", "auto", "--uce-fallback-step", "0"]).is_err());
+        assert!(parse_uce(&[
+            "--uce-recruit-mode",
+            "auto",
+            "--uce-fallback-min-alignment-identity",
+            "1.1"
+        ])
+        .is_err());
+        assert!(parse_uce(&["--uce-recruit-mode", "auto", "--legacy-uce-filter"]).is_err());
     }
 
     #[test]
