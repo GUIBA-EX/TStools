@@ -2213,7 +2213,7 @@ fn execute_uce(
         if opt.uce_recruit_mode == "auto" {
             let started = Instant::now();
             let input_bytes = profile_path_size(&sample_dir.join("results"));
-            let result = execute_uce_fallback_probe_gate(opt, &sample_dir);
+            let result = execute_uce_fallback_probe_gate(opt, &sample_dir, assembler_threads);
             record_profile_stage(
                 profile,
                 sample,
@@ -2271,7 +2271,11 @@ fn archive_fallback_probe_rejected(sample_dir: &Path, locus: &str) -> Result<(),
     Ok(())
 }
 
-fn execute_uce_fallback_probe_gate(opt: &Options, sample_dir: &Path) -> Result<(), String> {
+fn execute_uce_fallback_probe_gate(
+    opt: &Options,
+    sample_dir: &Path,
+    workers: usize,
+) -> Result<(), String> {
     let recruit_audit = sample_dir.join("uce_recruit_passes.tsv");
     let fallback_loci = uce_recruit::fallback_recruited_loci(&recruit_audit)?;
     let mut summary = read_uce_summary(&sample_dir.join("uce_assembly_summary.csv"))?;
@@ -2286,7 +2290,18 @@ fn execute_uce_fallback_probe_gate(opt: &Options, sample_dir: &Path) -> Result<(
         };
         contigs.insert(locus.clone(), sequence);
     }
-    let evidence = uce_recruit::evaluate_contig_probe_support(Path::new(&opt.reference), &contigs)?;
+    let gate_workers = if contigs.is_empty() {
+        0
+    } else {
+        workers.max(1).min(contigs.len())
+    };
+    let evaluation_started = Instant::now();
+    let evidence = uce_recruit::evaluate_contig_probe_support_parallel(
+        Path::new(&opt.reference),
+        &contigs,
+        workers,
+    )?;
+    let evaluation_seconds = evaluation_started.elapsed().as_secs_f64();
     uce_recruit::write_contig_probe_audit(
         &sample_dir.join("uce_recruit_contig_probe_gate.tsv"),
         &evidence,
@@ -2323,10 +2338,12 @@ fn execute_uce_fallback_probe_gate(opt: &Options, sample_dir: &Path) -> Result<(
     write_uce_summary(&sample_dir.join("uce_assembly_summary.csv"), &summary)?;
     write_result_dict_from_uce_summary(sample_dir, &summary)?;
     eprintln!(
-        "UCE auto fallback contig probe gate: {} accepted, {} rejected, {} recruited loci had no accepted contig",
+        "UCE auto fallback contig probe gate: {} accepted, {} rejected, {} recruited loci had no accepted contig; {} worker(s), {:.3}s probe evaluation",
         accepted,
         rejected,
         fallback_loci.len().saturating_sub(evidence.len()),
+        gate_workers,
+        evaluation_seconds,
     );
     Ok(())
 }

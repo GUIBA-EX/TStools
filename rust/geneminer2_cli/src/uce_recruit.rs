@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 use uce_filter_core::alignment::align_read;
 use uce_filter_core::index::{RecruitScratch, UceIndex};
 
@@ -11,7 +13,7 @@ pub(crate) const FALLBACK_CONTIG_MIN_LENGTH: usize = 200;
 const FALLBACK_CONTIG_OTHER_SCORE_RATIO: f64 = 0.95;
 const FALLBACK_CONTIG_ALIGNMENT_BAND: usize = 64;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ContigProbeEvidence {
     pub(crate) locus: String,
     pub(crate) sequence_length: usize,
@@ -42,9 +44,10 @@ fn alignment_metrics(index: &UceIndex, sequence: &[u8], locus: u32) -> Option<(i
     ))
 }
 
-pub(crate) fn evaluate_contig_probe_support(
+pub(crate) fn evaluate_contig_probe_support_parallel(
     references: &Path,
     contigs: &BTreeMap<String, String>,
+    workers: usize,
 ) -> Result<Vec<ContigProbeEvidence>, String> {
     if contigs.is_empty() {
         return Ok(Vec::new());
@@ -56,114 +59,173 @@ pub(crate) fn evaluate_contig_probe_support(
         .enumerate()
         .map(|(id, locus)| (locus.name.as_str(), id as u32))
         .collect::<BTreeMap<_, _>>();
-    let mut recruited = RecruitScratch::default();
-    let mut evidence = Vec::with_capacity(contigs.len());
-    for (locus, sequence) in contigs {
-        let Some(&target_locus) = locus_ids.get(locus.as_str()) else {
+    let contigs = contigs.iter().collect::<Vec<_>>();
+    for &(locus, _) in &contigs {
+        if !locus_ids.contains_key(locus.as_str()) {
             return Err(format!(
                 "UCE fallback probe gate cannot find reference locus '{locus}'"
             ));
-        };
-        if sequence.len() < FALLBACK_CONTIG_MIN_LENGTH {
-            evidence.push(ContigProbeEvidence {
-                locus: locus.clone(),
-                sequence_length: sequence.len(),
-                accepted: false,
-                reason: "contig_length_below_200",
-                target_score: 0,
-                target_probe_coverage: 0.0,
-                target_identity: 0.0,
-                best_other_locus: String::new(),
-                best_other_score: 0,
-                near_tie_other_loci: 0,
-            });
-            continue;
         }
-        let Some((target_score, target_probe_coverage, target_identity)) =
-            alignment_metrics(&index, sequence.as_bytes(), target_locus)
-        else {
-            evidence.push(ContigProbeEvidence {
-                locus: locus.clone(),
-                sequence_length: sequence.len(),
-                accepted: false,
-                reason: "no_target_probe_alignment",
-                target_score: 0,
-                target_probe_coverage: 0.0,
-                target_identity: 0.0,
-                best_other_locus: String::new(),
-                best_other_score: 0,
-                near_tie_other_loci: 0,
-            });
-            continue;
-        };
-        let target_failure = if target_probe_coverage < FALLBACK_CONTIG_MIN_PROBE_COVERAGE {
-            Some("target_probe_coverage_below_0.80")
-        } else if target_identity < FALLBACK_CONTIG_MIN_PROBE_IDENTITY {
-            Some("target_probe_identity_below_0.80")
-        } else {
-            None
-        };
-        if let Some(reason) = target_failure {
-            evidence.push(ContigProbeEvidence {
-                locus: locus.clone(),
-                sequence_length: sequence.len(),
-                accepted: false,
-                reason,
-                target_score,
-                target_probe_coverage,
-                target_identity,
-                best_other_locus: String::new(),
-                best_other_score: 0,
-                near_tie_other_loci: 0,
-            });
-            continue;
+    }
+    let worker_count = workers.max(1).min(contigs.len());
+    if worker_count == 1 {
+        return evaluate_contig_probe_chunk(&index, &locus_ids, &contigs);
+    }
+    let next_contig = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            handles.push(scope.spawn(|| {
+                let mut recruited = RecruitScratch::default();
+                let mut rows = Vec::new();
+                loop {
+                    let row_index = next_contig.fetch_add(1, Ordering::Relaxed);
+                    let Some(&(locus, sequence)) = contigs.get(row_index) else {
+                        break;
+                    };
+                    rows.push((
+                        row_index,
+                        evaluate_contig_probe_row(
+                            &index,
+                            &locus_ids,
+                            locus,
+                            sequence,
+                            &mut recruited,
+                        ),
+                    ));
+                }
+                rows
+            }));
         }
-        recruited.begin(index.loci.len());
-        index.recruit(sequence.as_bytes(), 1, &mut recruited, None);
-        let mut best_other = None::<(u32, i32)>;
-        let mut near_tie_other_loci = 0_usize;
-        for &candidate in recruited.loci() {
-            if candidate == target_locus {
-                continue;
-            }
-            let Some((score, coverage, identity)) =
-                alignment_metrics(&index, sequence.as_bytes(), candidate)
-            else {
-                continue;
-            };
-            if best_other.is_none_or(|(_, best_score)| score > best_score) {
-                best_other = Some((candidate, score));
-            }
-            if coverage >= FALLBACK_CONTIG_MIN_PROBE_COVERAGE
-                && identity >= FALLBACK_CONTIG_MIN_PROBE_IDENTITY
-                && score as f64 >= FALLBACK_CONTIG_OTHER_SCORE_RATIO * target_score as f64
-            {
-                near_tie_other_loci += 1;
-            }
+        let mut indexed_evidence = Vec::with_capacity(contigs.len());
+        for handle in handles {
+            let rows = handle
+                .join()
+                .map_err(|_| "UCE fallback probe gate worker panicked".to_owned())?;
+            indexed_evidence.extend(rows);
         }
-        let (accepted, reason) = if near_tie_other_loci > 0 {
-            (false, "near_tie_other_locus")
-        } else {
-            (true, "pass")
-        };
-        let (best_other_locus, best_other_score) = best_other.map_or_else(
-            || (String::new(), 0),
-            |(id, score)| (index.loci[id as usize].name.clone(), score),
-        );
-        evidence.push(ContigProbeEvidence {
-            locus: locus.clone(),
+        indexed_evidence.sort_unstable_by_key(|(row_index, _)| *row_index);
+        Ok(indexed_evidence.into_iter().map(|(_, row)| row).collect())
+    })
+}
+
+fn evaluate_contig_probe_chunk(
+    index: &UceIndex,
+    locus_ids: &BTreeMap<&str, u32>,
+    contigs: &[(&String, &String)],
+) -> Result<Vec<ContigProbeEvidence>, String> {
+    let mut recruited = RecruitScratch::default();
+    Ok(contigs
+        .iter()
+        .map(|&(locus, sequence)| {
+            evaluate_contig_probe_row(index, locus_ids, locus, sequence, &mut recruited)
+        })
+        .collect())
+}
+
+fn evaluate_contig_probe_row(
+    index: &UceIndex,
+    locus_ids: &BTreeMap<&str, u32>,
+    locus: &str,
+    sequence: &str,
+    recruited: &mut RecruitScratch,
+) -> ContigProbeEvidence {
+    let target_locus = locus_ids[locus];
+    if sequence.len() < FALLBACK_CONTIG_MIN_LENGTH {
+        return ContigProbeEvidence {
+            locus: locus.to_owned(),
             sequence_length: sequence.len(),
-            accepted,
+            accepted: false,
+            reason: "contig_length_below_200",
+            target_score: 0,
+            target_probe_coverage: 0.0,
+            target_identity: 0.0,
+            best_other_locus: String::new(),
+            best_other_score: 0,
+            near_tie_other_loci: 0,
+        };
+    }
+    let Some((target_score, target_probe_coverage, target_identity)) =
+        alignment_metrics(index, sequence.as_bytes(), target_locus)
+    else {
+        return ContigProbeEvidence {
+            locus: locus.to_owned(),
+            sequence_length: sequence.len(),
+            accepted: false,
+            reason: "no_target_probe_alignment",
+            target_score: 0,
+            target_probe_coverage: 0.0,
+            target_identity: 0.0,
+            best_other_locus: String::new(),
+            best_other_score: 0,
+            near_tie_other_loci: 0,
+        };
+    };
+    let target_failure = if target_probe_coverage < FALLBACK_CONTIG_MIN_PROBE_COVERAGE {
+        Some("target_probe_coverage_below_0.80")
+    } else if target_identity < FALLBACK_CONTIG_MIN_PROBE_IDENTITY {
+        Some("target_probe_identity_below_0.80")
+    } else {
+        None
+    };
+    if let Some(reason) = target_failure {
+        return ContigProbeEvidence {
+            locus: locus.to_owned(),
+            sequence_length: sequence.len(),
+            accepted: false,
             reason,
             target_score,
             target_probe_coverage,
             target_identity,
-            best_other_locus,
-            best_other_score,
-            near_tie_other_loci,
-        });
+            best_other_locus: String::new(),
+            best_other_score: 0,
+            near_tie_other_loci: 0,
+        };
     }
-    Ok(evidence)
+    recruited.begin(index.loci.len());
+    index.recruit(sequence.as_bytes(), 1, recruited, None);
+    let mut best_other = None::<(u32, i32)>;
+    let mut near_tie_other_loci = 0_usize;
+    for &candidate in recruited.loci() {
+        if candidate == target_locus {
+            continue;
+        }
+        let Some((score, coverage, identity)) =
+            alignment_metrics(index, sequence.as_bytes(), candidate)
+        else {
+            continue;
+        };
+        if best_other.is_none_or(|(_, best_score)| score > best_score) {
+            best_other = Some((candidate, score));
+        }
+        if coverage >= FALLBACK_CONTIG_MIN_PROBE_COVERAGE
+            && identity >= FALLBACK_CONTIG_MIN_PROBE_IDENTITY
+            && score as f64 >= FALLBACK_CONTIG_OTHER_SCORE_RATIO * target_score as f64
+        {
+            near_tie_other_loci += 1;
+        }
+    }
+    let (accepted, reason) = if near_tie_other_loci > 0 {
+        (false, "near_tie_other_locus")
+    } else {
+        (true, "pass")
+    };
+    let (best_other_locus, best_other_score) = best_other.map_or_else(
+        || (String::new(), 0),
+        |(id, score)| (index.loci[id as usize].name.clone(), score),
+    );
+    ContigProbeEvidence {
+        locus: locus.to_owned(),
+        sequence_length: sequence.len(),
+        accepted,
+        reason,
+        target_score,
+        target_probe_coverage,
+        target_identity,
+        best_other_locus,
+        best_other_score,
+        near_tie_other_loci,
+    }
 }
 
 pub(crate) fn fallback_recruited_loci(path: &Path) -> Result<BTreeSet<String>, String> {
@@ -790,7 +852,12 @@ mod tests {
                 ),
             ),
         ]);
-        let evidence = evaluate_contig_probe_support(&references, &contigs).unwrap();
+        let evidence = evaluate_contig_probe_support_parallel(&references, &contigs, 1).unwrap();
+        let parallel = evaluate_contig_probe_support_parallel(&references, &contigs, 3).unwrap();
+        let overprovisioned =
+            evaluate_contig_probe_support_parallel(&references, &contigs, 64).unwrap();
+        assert_eq!(parallel, evidence);
+        assert_eq!(overprovisioned, evidence);
         let by_locus = evidence
             .iter()
             .map(|row| (row.locus.as_str(), row))
