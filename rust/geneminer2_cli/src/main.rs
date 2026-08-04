@@ -981,6 +981,18 @@ fn build_uce_rescue_reference(
     Ok(added)
 }
 
+fn review_only_provisional_cores(summary: &UceSummary) -> BTreeSet<String> {
+    summary
+        .rows
+        .iter()
+        .filter(|(_, row)| {
+            row.get("auto_recruit_core_anchor_status")
+                .is_some_and(|status| status == "anchored_with_review")
+        })
+        .map(|(locus, _)| locus.clone())
+        .collect()
+}
+
 fn build_uce_terminal_baits(
     sample: &Path,
     baits: &Path,
@@ -1719,6 +1731,7 @@ fn execute_uce_rescue(
         "--uce-rescue-inverted-repeat-min-bp",
     )?;
     let initial = read_uce_summary(&sample_dir.join("uce_assembly_summary.csv"))?;
+    let review_only_cores = review_only_provisional_cores(&initial);
     let mut current = initial.clone();
     let mut previous = initial.clone();
     let mut records: Vec<(usize, String, UceSummary)> = Vec::new();
@@ -1733,6 +1746,26 @@ fn execute_uce_rescue(
             Some(terminal_rescue_loci(&previous, &current))
         };
         if candidate.as_ref().is_some_and(|loci| loci.is_empty()) {
+            break;
+        }
+        let active = if round == 1 {
+            if review_only_cores.is_empty() {
+                None
+            } else {
+                Some(
+                    reference_loci(Path::new(&opt.reference))?
+                        .into_iter()
+                        .map(|(locus, _)| locus)
+                        .filter(|locus| !review_only_cores.contains(locus))
+                        .collect::<BTreeSet<_>>(),
+                )
+            }
+        } else {
+            let mut active = candidate.clone().unwrap_or_default();
+            active.retain(|locus| !review_only_cores.contains(locus));
+            Some(active)
+        };
+        if active.as_ref().is_some_and(|loci| loci.is_empty()) {
             break;
         }
         // Keep rescue-only inputs outside the sample directory. The sample
@@ -1750,7 +1783,7 @@ fn execute_uce_rescue(
             sample_dir,
             &reference,
             minimum,
-            candidate.as_ref(),
+            active.as_ref(),
         )?;
         if added == 0 {
             if round == 1 {
@@ -1758,7 +1791,10 @@ fn execute_uce_rescue(
             }
             break;
         }
-        let recruit = if let Some(active) = candidate.as_ref() {
+        let recruit = if round > 1 {
+            let active = active
+                .as_ref()
+                .ok_or("terminal UCE rescue has no active locus set")?;
             let terminal = root.join("terminal_baits");
             let baits =
                 build_uce_terminal_baits(sample_dir, &terminal, active, terminal_window, minimum)?;
@@ -1798,13 +1834,21 @@ fn execute_uce_rescue(
             let mut statuses = std::collections::BTreeMap::new();
             let mut evidence_by_locus = std::collections::BTreeMap::new();
             for (locus, before_row) in &before.rows {
-                let inactive = candidate
+                let inactive = active
                     .as_ref()
                     .is_some_and(|active| !active.contains(locus));
                 if inactive {
                     restore_rescue_locus(sample_dir, &backup, locus)?;
                     after.rows.insert(locus.clone(), before_row.clone());
-                    statuses.insert(locus.clone(), "stable_not_recruited".into());
+                    statuses.insert(
+                        locus.clone(),
+                        if review_only_cores.contains(locus) {
+                            "stable_review_only_core"
+                        } else {
+                            "stable_not_recruited"
+                        }
+                        .into(),
+                    );
                     continue;
                 }
 
@@ -7073,6 +7117,29 @@ mod tests {
             .unwrap()
             .contains("AAAAGGGG"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn review_only_provisional_core_is_not_rescue_eligible() {
+        let clean = BTreeMap::from([
+            ("locus".into(), "clean".into()),
+            ("auto_recruit_core_anchor_status".into(), "anchored".into()),
+        ]);
+        let review = BTreeMap::from([
+            ("locus".into(), "review".into()),
+            (
+                "auto_recruit_core_anchor_status".into(),
+                "anchored_with_review".into(),
+            ),
+        ]);
+        let summary = UceSummary {
+            headers: vec!["locus".into(), "auto_recruit_core_anchor_status".into()],
+            rows: BTreeMap::from([("clean".into(), clean), ("review".into(), review)]),
+        };
+        assert_eq!(
+            review_only_provisional_cores(&summary),
+            ["review".to_owned()].into_iter().collect()
+        );
     }
 
     #[test]

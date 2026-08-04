@@ -62,7 +62,7 @@ cli/geneminer2 filter assemble \
   --assembly-mode uce --uce-recruit-mode auto
 ```
 
-`auto` 先执行与默认行为相同的快速招募，只对快速阶段没有选中 fragments 的 locus 再扫描一次 FASTQ（默认 k=21、step=1、独立验证 k=19）。敏感阶段先用未恢复 locus 子集作粗招募门控；只对命中该子集的 fragments 用完整 probe 面板扩展候选并检查多 locus 歧义，再要求 read pair 至少一端与目标 probe/reference 的局部比对达到 45 bp、80% identity，最后只合并唯一支持某个未恢复 locus 的 reads；随后只组装一次。仅由敏感阶段恢复的 provisional core 还必须达到 200 bp，并与目标 probe 达到至少 80% coverage、80% identity，不能存在得分接近的其他 probe locus，也不能包含至少 150 bp 的长倒置重复，才会锚定为该 locus。锚定 core 中至少 40 bp 的内部 reads 链缺口会被明确标记为复核项，但不会单独硬拒绝；同个体基因组校准显示，低覆盖的真实共线位点也可能出现该信号。若同时启用 `--uce-rescue-reads`，只有锚定 core 才会作为样本自身 bait 进入现有 whole-contig/terminal rescue 与 guard。该策略扩大的是候选 reads 招募范围，不代表候选位点已经被证明正确。默认模式仍为 `fast`，因此现有命令、速度和结果不变。
+`auto` 先执行与默认行为相同的快速招募，只对快速阶段没有选中 fragments 的 locus 再扫描一次 FASTQ（默认 k=21、step=1、独立验证 k=19）。敏感阶段先用未恢复 locus 子集作粗招募门控；只对命中该子集的 fragments 用完整 probe 面板扩展候选并检查多 locus 歧义，再要求 read pair 至少一端与目标 probe/reference 的局部比对达到 45 bp、80% identity，最后只合并唯一支持某个未恢复 locus 的 reads；随后只组装一次。仅由敏感阶段恢复的 provisional core 还必须达到 200 bp，并与目标 probe 达到至少 80% coverage、80% identity，不能存在得分接近的其他 probe locus，也不能包含至少 150 bp 的长倒置重复，才会锚定为该 locus。锚定 core 中至少 40 bp 的内部 reads 链缺口会被明确标记为复核项，但不会单独硬拒绝；同个体基因组校准显示，低覆盖的真实共线位点也可能出现该信号。若同时启用 `--uce-rescue-reads`，无复核项的锚定 core 才会作为样本自身 bait 进入现有 whole-contig/terminal rescue 与 guard；review-only core 保留为候选，但不会被 rescue 扩展。该策略扩大的是候选 reads 招募范围，不代表候选位点已经被证明正确。默认模式仍为 `fast`，因此现有命令、速度和结果不变。
 
 自动敏感招募会保留 `uce_filter_summary.fast.tsv`；实际发生第二阶段时还会生成 `uce_filter_summary.fallback.tsv`。`uce_recruit_passes.tsv` 逐 locus 记录快速阶段、敏感阶段和最终来源，`uce_recruit_contig_probe_gate.tsv` 覆盖所有 fallback locus，记录 assembler、probe、锚定、倒置重复和内部 gap 证据；被拒绝的结果移入 `fallback_probe_rejected/`，不会静默删除。启用 rescue 时，后续状态继续写入 `uce_rescue_rounds.csv` 和 `uce_rescue_summary.csv`。
 
