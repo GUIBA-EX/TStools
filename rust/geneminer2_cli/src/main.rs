@@ -2183,7 +2183,7 @@ fn execute_uce(
         if opt.uce_recruit_mode == "auto" {
             let started = Instant::now();
             let input_bytes = profile_path_size(&sample_dir.join("results"));
-            let result = execute_uce_fallback_probe_gate(opt, &sample_dir);
+            let result = execute_uce_fallback_probe_gate(opt, &sample_dir, assembler_threads);
             record_profile_stage(
                 profile,
                 sample,
@@ -2241,7 +2241,11 @@ fn archive_fallback_probe_rejected(sample_dir: &Path, locus: &str) -> Result<(),
     Ok(())
 }
 
-fn execute_uce_fallback_probe_gate(opt: &Options, sample_dir: &Path) -> Result<(), String> {
+fn execute_uce_fallback_probe_gate(
+    opt: &Options,
+    sample_dir: &Path,
+    workers: usize,
+) -> Result<(), String> {
     let recruit_audit = sample_dir.join("uce_recruit_passes.tsv");
     let fallback_loci = uce_recruit::fallback_recruited_loci(&recruit_audit)?;
     let mut summary = read_uce_summary(&sample_dir.join("uce_assembly_summary.csv"))?;
@@ -2262,11 +2266,21 @@ fn execute_uce_fallback_probe_gate(opt: &Options, sample_dir: &Path) -> Result<(
         "150",
         "--uce-rescue-inverted-repeat-min-bp",
     )?;
-    let mut evaluated =
-        uce_recruit::evaluate_contig_probe_support(Path::new(&opt.reference), &contigs)?
-            .into_iter()
-            .map(|row| (row.locus.clone(), row))
-            .collect::<BTreeMap<_, _>>();
+    let gate_workers = if contigs.is_empty() {
+        0
+    } else {
+        workers.max(1).min(contigs.len())
+    };
+    let evaluation_started = Instant::now();
+    let mut evaluated = uce_recruit::evaluate_contig_probe_support_parallel(
+        Path::new(&opt.reference),
+        &contigs,
+        workers,
+    )?
+    .into_iter()
+    .map(|row| (row.locus.clone(), row))
+    .collect::<BTreeMap<_, _>>();
+    let evaluation_seconds = evaluation_started.elapsed().as_secs_f64();
     let mut evidence = Vec::with_capacity(fallback_loci.len());
     for locus in &fallback_loci {
         if !uce_row_accepted(summary.rows.get(locus)) {
@@ -2366,12 +2380,14 @@ fn execute_uce_fallback_probe_gate(opt: &Options, sample_dir: &Path) -> Result<(
     write_uce_summary(&sample_dir.join("uce_assembly_summary.csv"), &summary)?;
     write_result_dict_from_uce_summary(sample_dir, &summary)?;
     eprintln!(
-        "UCE auto provisional core gate: {} anchored ({} internal-gap review), {} probe rejected, {} structure rejected, {} assembler rejected or missing",
+        "UCE auto provisional core gate: {} anchored ({} internal-gap review), {} probe rejected, {} structure rejected, {} assembler rejected or missing; {} worker(s), {:.3}s probe evaluation",
         anchored,
         review,
         probe_rejected,
         structure_rejected,
         assembler_rejected,
+        gate_workers,
+        evaluation_seconds,
     );
     Ok(())
 }
