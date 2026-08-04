@@ -3,6 +3,8 @@ use std::collections::HashMap;
 const KMER: usize = 15;
 const ANCHOR: usize = 25;
 const MAX_KMER_OCCURRENCES: usize = 16;
+const INVERTED_REPEAT_KMER: usize = 21;
+const INVERTED_REPEAT_MAX_KMER_OCCURRENCES: usize = 64;
 pub const MINIMUM_NEW_UNSUPPORTED_GAP: usize = 40;
 
 fn reverse_complement(sequence: &str) -> String {
@@ -17,6 +19,107 @@ fn reverse_complement(sequence: &str) -> String {
             _ => 'N',
         })
         .collect()
+}
+
+fn encode_dna_kmer(sequence: &[u8]) -> Option<u64> {
+    let mut encoded = 0_u64;
+    for base in sequence {
+        encoded = (encoded << 2)
+            | match base.to_ascii_uppercase() {
+                b'A' => 0,
+                b'C' => 1,
+                b'G' => 2,
+                b'T' => 3,
+                _ => return None,
+            };
+    }
+    Some(encoded)
+}
+
+fn reverse_complement_packed(mut encoded: u64, k: usize) -> u64 {
+    let mut reverse = 0_u64;
+    for _ in 0..k {
+        reverse = (reverse << 2) | (3 - (encoded & 3));
+        encoded >>= 2;
+    }
+    reverse
+}
+
+/// Detects an exact, long, self reverse-complement match. The 21-mer chains
+/// are grouped by anti-diagonal, so a forward run at increasing positions is
+/// paired with a reverse-complement run at decreasing positions. Highly
+/// repetitive 21-mers are ignored to keep the guard bounded.
+pub fn has_long_inverted_repeat(sequence: &str, minimum_span: usize) -> bool {
+    let k = INVERTED_REPEAT_KMER;
+    if minimum_span == 0 || sequence.len() < k || sequence.len() < minimum_span {
+        return false;
+    }
+    let bytes = sequence.as_bytes();
+    let encoded = (0..=bytes.len() - k)
+        .map(|start| encode_dna_kmer(&bytes[start..start + k]))
+        .collect::<Vec<_>>();
+    let mut positions: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (position, kmer) in encoded.iter().enumerate() {
+        let Some(kmer) = kmer else {
+            continue;
+        };
+        let bucket = positions.entry(*kmer).or_default();
+        if bucket.len() <= INVERTED_REPEAT_MAX_KMER_OCCURRENCES {
+            bucket.push(position);
+        }
+    }
+
+    let mut pairs = Vec::new();
+    for (left, kmer) in encoded.iter().enumerate() {
+        let Some(kmer) = kmer else {
+            continue;
+        };
+        let reverse = reverse_complement_packed(*kmer, k);
+        let Some(matches) = positions.get(&reverse) else {
+            continue;
+        };
+        if matches.len() > INVERTED_REPEAT_MAX_KMER_OCCURRENCES {
+            continue;
+        }
+        pairs.extend(
+            matches
+                .iter()
+                .copied()
+                .filter(|right| *right > left)
+                .map(|right| (left + right, left, right)),
+        );
+    }
+    pairs.sort_unstable();
+
+    let mut chain_start = None::<(usize, usize, usize)>;
+    let mut previous = None::<(usize, usize, usize)>;
+    for (diagonal, left, right) in pairs {
+        let consecutive = previous.is_some_and(|(old_diagonal, old_left, old_right)| {
+            diagonal == old_diagonal && left == old_left + 1 && right + 1 == old_right
+        });
+        if !consecutive {
+            chain_start = Some((diagonal, left, right));
+        }
+        previous = Some((diagonal, left, right));
+        let Some((_, start_left, start_right)) = chain_start else {
+            continue;
+        };
+        let span = left - start_left + k;
+        if span < minimum_span {
+            continue;
+        }
+        let first_start = start_left;
+        let first_end = left + k;
+        let second_start = right;
+        let second_end = start_right + k;
+        let overlap = first_end
+            .min(second_end)
+            .saturating_sub(first_start.max(second_start));
+        if overlap.saturating_mul(5) <= span {
+            return true;
+        }
+    }
+    false
 }
 
 fn maximum_bracketed_zero_run(values: &[usize]) -> usize {
@@ -137,6 +240,17 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn long_inverted_repeat_detector_finds_exact_nonoverlapping_arms() {
+        let arm = dna(180);
+        let spacer = reverse_complement(&dna(60));
+        let sequence = format!("{arm}{spacer}{}", reverse_complement(&arm));
+        assert!(has_long_inverted_repeat(&sequence, 150));
+        assert!(!has_long_inverted_repeat(&sequence, 200));
+        assert!(!has_long_inverted_repeat(&dna(700), 150));
+        assert!(!has_long_inverted_repeat("NNNNACGTNNNN", 10));
     }
 
     #[test]
