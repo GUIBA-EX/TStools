@@ -19,12 +19,60 @@ pub(crate) struct ContigProbeEvidence {
     pub(crate) sequence_length: usize,
     pub(crate) accepted: bool,
     pub(crate) reason: &'static str,
+    pub(crate) core_anchor_status: &'static str,
+    pub(crate) structural_review: &'static str,
+    pub(crate) long_inverted_repeat: bool,
+    pub(crate) maximum_unsupported_internal_gap: usize,
     pub(crate) target_score: i32,
     pub(crate) target_probe_coverage: f64,
     pub(crate) target_identity: f64,
     pub(crate) best_other_locus: String,
     pub(crate) best_other_score: i32,
     pub(crate) near_tie_other_loci: usize,
+}
+
+impl ContigProbeEvidence {
+    pub(crate) fn unavailable(locus: &str, reason: &'static str) -> Self {
+        Self {
+            locus: locus.to_owned(),
+            sequence_length: 0,
+            accepted: false,
+            reason,
+            core_anchor_status: reason,
+            structural_review: "none",
+            long_inverted_repeat: false,
+            maximum_unsupported_internal_gap: 0,
+            target_score: 0,
+            target_probe_coverage: 0.0,
+            target_identity: 0.0,
+            best_other_locus: String::new(),
+            best_other_score: 0,
+            near_tie_other_loci: 0,
+        }
+    }
+
+    pub(crate) fn apply_structure_checks(
+        &mut self,
+        long_inverted_repeat: bool,
+        maximum_unsupported_internal_gap: usize,
+    ) {
+        if !self.accepted {
+            return;
+        }
+        self.long_inverted_repeat = long_inverted_repeat;
+        self.maximum_unsupported_internal_gap = maximum_unsupported_internal_gap;
+        if long_inverted_repeat {
+            self.accepted = false;
+            self.reason = "long_inverted_repeat";
+            self.core_anchor_status = "structure_rejected";
+        } else if maximum_unsupported_internal_gap >= crate::rescue_qc::MINIMUM_NEW_UNSUPPORTED_GAP
+        {
+            self.core_anchor_status = "anchored_with_review";
+            self.structural_review = "internal_gap_ge40";
+        } else {
+            self.core_anchor_status = "anchored";
+        }
+    }
 }
 
 fn alignment_metrics(index: &UceIndex, sequence: &[u8], locus: u32) -> Option<(i32, f64, f64)> {
@@ -69,7 +117,7 @@ pub(crate) fn evaluate_contig_probe_support_parallel(
     }
     let worker_count = workers.max(1).min(contigs.len());
     if worker_count == 1 {
-        return evaluate_contig_probe_chunk(&index, &locus_ids, &contigs);
+        return Ok(evaluate_contig_probe_chunk(&index, &locus_ids, &contigs));
     }
     let next_contig = AtomicUsize::new(0);
     thread::scope(|scope| {
@@ -113,14 +161,14 @@ fn evaluate_contig_probe_chunk(
     index: &UceIndex,
     locus_ids: &BTreeMap<&str, u32>,
     contigs: &[(&String, &String)],
-) -> Result<Vec<ContigProbeEvidence>, String> {
+) -> Vec<ContigProbeEvidence> {
     let mut recruited = RecruitScratch::default();
-    Ok(contigs
+    contigs
         .iter()
         .map(|&(locus, sequence)| {
             evaluate_contig_probe_row(index, locus_ids, locus, sequence, &mut recruited)
         })
-        .collect())
+        .collect()
 }
 
 fn evaluate_contig_probe_row(
@@ -137,6 +185,10 @@ fn evaluate_contig_probe_row(
             sequence_length: sequence.len(),
             accepted: false,
             reason: "contig_length_below_200",
+            core_anchor_status: "probe_rejected",
+            structural_review: "none",
+            long_inverted_repeat: false,
+            maximum_unsupported_internal_gap: 0,
             target_score: 0,
             target_probe_coverage: 0.0,
             target_identity: 0.0,
@@ -153,6 +205,10 @@ fn evaluate_contig_probe_row(
             sequence_length: sequence.len(),
             accepted: false,
             reason: "no_target_probe_alignment",
+            core_anchor_status: "probe_rejected",
+            structural_review: "none",
+            long_inverted_repeat: false,
+            maximum_unsupported_internal_gap: 0,
             target_score: 0,
             target_probe_coverage: 0.0,
             target_identity: 0.0,
@@ -174,6 +230,10 @@ fn evaluate_contig_probe_row(
             sequence_length: sequence.len(),
             accepted: false,
             reason,
+            core_anchor_status: "probe_rejected",
+            structural_review: "none",
+            long_inverted_repeat: false,
+            maximum_unsupported_internal_gap: 0,
             target_score,
             target_probe_coverage,
             target_identity,
@@ -219,6 +279,14 @@ fn evaluate_contig_probe_row(
         sequence_length: sequence.len(),
         accepted,
         reason,
+        core_anchor_status: if accepted {
+            "probe_pass"
+        } else {
+            "probe_rejected"
+        },
+        structural_review: "none",
+        long_inverted_repeat: false,
+        maximum_unsupported_internal_gap: 0,
         target_score,
         target_probe_coverage,
         target_identity,
@@ -292,17 +360,21 @@ pub(crate) fn write_contig_probe_audit(
     })?);
     writeln!(
         writer,
-        "locus	sequence_length	accepted	reason	target_score	target_probe_coverage	target_identity	best_other_locus	best_other_score	near_tie_other_loci"
+        "locus	sequence_length	accepted	reason	core_anchor_status	structural_review	long_inverted_repeat	maximum_unsupported_internal_gap	target_score	target_probe_coverage	target_identity	best_other_locus	best_other_score	near_tie_other_loci"
     )
     .map_err(|error| error.to_string())?;
     for row in evidence {
         writeln!(
             writer,
-            "{}	{}	{}	{}	{}	{:.6}	{:.6}	{}	{}	{}",
+            "{}	{}	{}	{}	{}	{}	{}	{}	{}	{:.6}	{:.6}	{}	{}	{}",
             row.locus,
             row.sequence_length,
             u8::from(row.accepted),
             row.reason,
+            row.core_anchor_status,
+            row.structural_review,
+            u8::from(row.long_inverted_repeat),
+            row.maximum_unsupported_internal_gap,
             row.target_score,
             row.target_probe_coverage,
             row.target_identity,
@@ -892,6 +964,45 @@ mod tests {
             fallback_recruited_loci(&audit).unwrap(),
             BTreeSet::from(["uce-2".into()])
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provisional_core_structure_checks_reject_inversion_but_review_gap() {
+        let mut clean = ContigProbeEvidence::unavailable("uce-clean", "fixture");
+        clean.accepted = true;
+        clean.reason = "pass";
+        clean.core_anchor_status = "probe_pass";
+        clean.apply_structure_checks(false, 0);
+        assert!(clean.accepted);
+        assert_eq!(clean.core_anchor_status, "anchored");
+        assert_eq!(clean.structural_review, "none");
+
+        let mut gap = clean.clone();
+        gap.locus = "uce-gap".into();
+        gap.apply_structure_checks(false, crate::rescue_qc::MINIMUM_NEW_UNSUPPORTED_GAP);
+        assert!(gap.accepted);
+        assert_eq!(gap.core_anchor_status, "anchored_with_review");
+        assert_eq!(gap.structural_review, "internal_gap_ge40");
+
+        let mut inverted = clean.clone();
+        inverted.locus = "uce-inverted".into();
+        inverted.apply_structure_checks(true, 0);
+        assert!(!inverted.accepted);
+        assert_eq!(inverted.reason, "long_inverted_repeat");
+        assert_eq!(inverted.core_anchor_status, "structure_rejected");
+
+        let root = test_root("core_audit");
+        fs::create_dir_all(&root).unwrap();
+        let audit = root.join("audit.tsv");
+        write_contig_probe_audit(&audit, &[clean, gap, inverted]).unwrap();
+        let text = fs::read_to_string(&audit).unwrap();
+        assert!(text
+            .lines()
+            .next()
+            .unwrap()
+            .contains("maximum_unsupported_internal_gap"));
+        assert!(text.contains("uce-gap	0	1	pass	anchored_with_review	internal_gap_ge40"));
         fs::remove_dir_all(root).unwrap();
     }
 }

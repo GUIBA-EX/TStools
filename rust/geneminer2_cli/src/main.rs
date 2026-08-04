@@ -6,7 +6,7 @@ mod rescue_qc;
 mod uce_recruit;
 
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Read};
@@ -26,8 +26,6 @@ const UCE_TERMINAL_MIN_BREADTH: f64 = 0.85;
 const UCE_TERMINAL_MAX_GAP: usize = 30;
 const UCE_TERMINAL_MIN_FRAGMENTS: usize = 2;
 const UCE_TERMINAL_MIN_BRIDGES: usize = 1;
-const UCE_INVERTED_REPEAT_KMER: usize = 21;
-const UCE_INVERTED_REPEAT_MAX_KMER_OCCURRENCES: usize = 64;
 
 const COMMANDS: &[&str] = &[
     "filter",
@@ -983,6 +981,18 @@ fn build_uce_rescue_reference(
     Ok(added)
 }
 
+fn review_only_provisional_cores(summary: &UceSummary) -> BTreeSet<String> {
+    summary
+        .rows
+        .iter()
+        .filter(|(_, row)| {
+            row.get("auto_recruit_core_anchor_status")
+                .is_some_and(|status| status == "anchored_with_review")
+        })
+        .map(|(locus, _)| locus.clone())
+        .collect()
+}
+
 fn build_uce_terminal_baits(
     sample: &Path,
     baits: &Path,
@@ -1200,107 +1210,6 @@ fn reverse_complement_text(sequence: &str) -> String {
         .collect()
 }
 
-fn encode_dna_kmer(sequence: &[u8]) -> Option<u64> {
-    let mut encoded = 0_u64;
-    for base in sequence {
-        encoded = (encoded << 2)
-            | match base.to_ascii_uppercase() {
-                b'A' => 0,
-                b'C' => 1,
-                b'G' => 2,
-                b'T' => 3,
-                _ => return None,
-            };
-    }
-    Some(encoded)
-}
-
-fn reverse_complement_packed(mut encoded: u64, k: usize) -> u64 {
-    let mut reverse = 0_u64;
-    for _ in 0..k {
-        reverse = (reverse << 2) | (3 - (encoded & 3));
-        encoded >>= 2;
-    }
-    reverse
-}
-
-/// Detects an exact, long, self reverse-complement match. The 21-mer chains
-/// are grouped by anti-diagonal, so a forward run at increasing positions is
-/// paired with a reverse-complement run at decreasing positions. Highly
-/// repetitive 21-mers are ignored to keep the rescue guard bounded.
-fn has_long_inverted_repeat(sequence: &str, minimum_span: usize) -> bool {
-    let k = UCE_INVERTED_REPEAT_KMER;
-    if minimum_span == 0 || sequence.len() < k || sequence.len() < minimum_span {
-        return false;
-    }
-    let bytes = sequence.as_bytes();
-    let encoded = (0..=bytes.len() - k)
-        .map(|start| encode_dna_kmer(&bytes[start..start + k]))
-        .collect::<Vec<_>>();
-    let mut positions: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (position, kmer) in encoded.iter().enumerate() {
-        let Some(kmer) = kmer else {
-            continue;
-        };
-        let bucket = positions.entry(*kmer).or_default();
-        if bucket.len() <= UCE_INVERTED_REPEAT_MAX_KMER_OCCURRENCES {
-            bucket.push(position);
-        }
-    }
-
-    let mut pairs = Vec::new();
-    for (left, kmer) in encoded.iter().enumerate() {
-        let Some(kmer) = kmer else {
-            continue;
-        };
-        let reverse = reverse_complement_packed(*kmer, k);
-        let Some(matches) = positions.get(&reverse) else {
-            continue;
-        };
-        if matches.len() > UCE_INVERTED_REPEAT_MAX_KMER_OCCURRENCES {
-            continue;
-        }
-        pairs.extend(
-            matches
-                .iter()
-                .copied()
-                .filter(|right| *right > left)
-                .map(|right| (left + right, left, right)),
-        );
-    }
-    pairs.sort_unstable();
-
-    let mut chain_start = None::<(usize, usize, usize)>;
-    let mut previous = None::<(usize, usize, usize)>;
-    for (diagonal, left, right) in pairs {
-        let consecutive = previous.is_some_and(|(old_diagonal, old_left, old_right)| {
-            diagonal == old_diagonal && left == old_left + 1 && right + 1 == old_right
-        });
-        if !consecutive {
-            chain_start = Some((diagonal, left, right));
-        }
-        previous = Some((diagonal, left, right));
-        let Some((_, start_left, start_right)) = chain_start else {
-            continue;
-        };
-        let span = left - start_left + k;
-        if span < minimum_span {
-            continue;
-        }
-        let first_start = start_left;
-        let first_end = left + k;
-        let second_start = right;
-        let second_end = start_right + k;
-        let overlap = first_end
-            .min(second_end)
-            .saturating_sub(first_start.max(second_start));
-        if overlap.saturating_mul(5) <= span {
-            return true;
-        }
-    }
-    false
-}
-
 fn locus_result_sequence(root: &Path, locus: &str) -> Result<Option<String>, String> {
     let path = root.join("results").join(format!("{locus}.fasta"));
     if !path.is_file() {
@@ -1322,10 +1231,10 @@ fn rescue_introduces_long_inverted_repeat(
     let after = locus_result_sequence(sample, locus)?;
     let before_has_repeat = before
         .as_deref()
-        .is_some_and(|sequence| has_long_inverted_repeat(sequence, minimum_span));
+        .is_some_and(|sequence| rescue_qc::has_long_inverted_repeat(sequence, minimum_span));
     let after_has_repeat = after
         .as_deref()
-        .is_some_and(|sequence| has_long_inverted_repeat(sequence, minimum_span));
+        .is_some_and(|sequence| rescue_qc::has_long_inverted_repeat(sequence, minimum_span));
     Ok(!before_has_repeat && after_has_repeat)
 }
 
@@ -1617,6 +1526,34 @@ fn restore_prior_rescue_rounds(
     Ok(())
 }
 
+fn restore_initial_uce_recruit_audits(sample: &Path, backup: &Path) -> Result<(), String> {
+    for name in [
+        "uce_filter_summary.fast.tsv",
+        "uce_filter_summary.fallback.tsv",
+        "uce_recruit_passes.tsv",
+        "uce_recruit_contig_probe_gate.tsv",
+    ] {
+        let source = backup.join(name);
+        let destination = sample.join(name);
+        if source.is_file() && !destination.exists() {
+            fs::copy(&source, &destination).map_err(|error| {
+                format!(
+                    "Unable to preserve UCE recruitment audit '{}' as '{}': {error}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+        }
+    }
+
+    let source = backup.join("fallback_probe_rejected");
+    let destination = sample.join("fallback_probe_rejected");
+    if source.is_dir() && !destination.exists() {
+        copy_tree(&source, &destination)?;
+    }
+    Ok(())
+}
+
 fn row_density(row: Option<&std::collections::BTreeMap<String, String>>) -> Option<f64> {
     let length = uce_number(row, "selected_contig_length")? as f64;
     let reads =
@@ -1794,6 +1731,7 @@ fn execute_uce_rescue(
         "--uce-rescue-inverted-repeat-min-bp",
     )?;
     let initial = read_uce_summary(&sample_dir.join("uce_assembly_summary.csv"))?;
+    let review_only_cores = review_only_provisional_cores(&initial);
     let mut current = initial.clone();
     let mut previous = initial.clone();
     let mut records: Vec<(usize, String, UceSummary)> = Vec::new();
@@ -1808,6 +1746,26 @@ fn execute_uce_rescue(
             Some(terminal_rescue_loci(&previous, &current))
         };
         if candidate.as_ref().is_some_and(|loci| loci.is_empty()) {
+            break;
+        }
+        let active = if round == 1 {
+            if review_only_cores.is_empty() {
+                None
+            } else {
+                Some(
+                    reference_loci(Path::new(&opt.reference))?
+                        .into_iter()
+                        .map(|(locus, _)| locus)
+                        .filter(|locus| !review_only_cores.contains(locus))
+                        .collect::<BTreeSet<_>>(),
+                )
+            }
+        } else {
+            let mut active = candidate.clone().unwrap_or_default();
+            active.retain(|locus| !review_only_cores.contains(locus));
+            Some(active)
+        };
+        if active.as_ref().is_some_and(|loci| loci.is_empty()) {
             break;
         }
         // Keep rescue-only inputs outside the sample directory. The sample
@@ -1825,7 +1783,7 @@ fn execute_uce_rescue(
             sample_dir,
             &reference,
             minimum,
-            candidate.as_ref(),
+            active.as_ref(),
         )?;
         if added == 0 {
             if round == 1 {
@@ -1833,7 +1791,10 @@ fn execute_uce_rescue(
             }
             break;
         }
-        let recruit = if let Some(active) = candidate.as_ref() {
+        let recruit = if round > 1 {
+            let active = active
+                .as_ref()
+                .ok_or("terminal UCE rescue has no active locus set")?;
             let terminal = root.join("terminal_baits");
             let baits =
                 build_uce_terminal_baits(sample_dir, &terminal, active, terminal_window, minimum)?;
@@ -1873,13 +1834,21 @@ fn execute_uce_rescue(
             let mut statuses = std::collections::BTreeMap::new();
             let mut evidence_by_locus = std::collections::BTreeMap::new();
             for (locus, before_row) in &before.rows {
-                let inactive = candidate
+                let inactive = active
                     .as_ref()
                     .is_some_and(|active| !active.contains(locus));
                 if inactive {
                     restore_rescue_locus(sample_dir, &backup, locus)?;
                     after.rows.insert(locus.clone(), before_row.clone());
-                    statuses.insert(locus.clone(), "stable_not_recruited".into());
+                    statuses.insert(
+                        locus.clone(),
+                        if review_only_cores.contains(locus) {
+                            "stable_review_only_core"
+                        } else {
+                            "stable_not_recruited"
+                        }
+                        .into(),
+                    );
                     continue;
                 }
 
@@ -1973,6 +1942,7 @@ fn execute_uce_rescue(
             write_uce_summary(&sample_dir.join("uce_assembly_summary.csv"), &after)?;
             write_result_dict_from_uce_summary(sample_dir, &after)?;
             restore_prior_rescue_rounds(sample_dir, &backup, round)?;
+            restore_initial_uce_recruit_audits(sample_dir, &backup)?;
             Ok(RescueRoundOutcome {
                 after,
                 statuses,
@@ -2290,58 +2260,132 @@ fn execute_uce_fallback_probe_gate(
         };
         contigs.insert(locus.clone(), sequence);
     }
+    let inverted_repeat_minimum = raw_number::<usize>(
+        &opt.raw,
+        &["--uce-rescue-inverted-repeat-min-bp"],
+        "150",
+        "--uce-rescue-inverted-repeat-min-bp",
+    )?;
     let gate_workers = if contigs.is_empty() {
         0
     } else {
         workers.max(1).min(contigs.len())
     };
     let evaluation_started = Instant::now();
-    let evidence = uce_recruit::evaluate_contig_probe_support_parallel(
+    let mut evaluated = uce_recruit::evaluate_contig_probe_support_parallel(
         Path::new(&opt.reference),
         &contigs,
         workers,
-    )?;
+    )?
+    .into_iter()
+    .map(|row| (row.locus.clone(), row))
+    .collect::<BTreeMap<_, _>>();
     let evaluation_seconds = evaluation_started.elapsed().as_secs_f64();
+    let mut evidence = Vec::with_capacity(fallback_loci.len());
+    for locus in &fallback_loci {
+        if !uce_row_accepted(summary.rows.get(locus)) {
+            evidence.push(uce_recruit::ContigProbeEvidence::unavailable(
+                locus,
+                "assembler_rejected",
+            ));
+            continue;
+        }
+        let Some(sequence) = contigs.get(locus) else {
+            evidence.push(uce_recruit::ContigProbeEvidence::unavailable(
+                locus,
+                "accepted_contig_missing",
+            ));
+            continue;
+        };
+        let mut row = evaluated
+            .remove(locus)
+            .ok_or_else(|| format!("missing UCE provisional core evidence for '{locus}'"))?;
+        if row.accepted {
+            let reads = read_locus_fastq(sample_dir, locus)?;
+            row.apply_structure_checks(
+                rescue_qc::has_long_inverted_repeat(sequence, inverted_repeat_minimum),
+                rescue_qc::maximum_unsupported_internal_gap(sequence, &reads),
+            );
+        }
+        evidence.push(row);
+    }
     uce_recruit::write_contig_probe_audit(
         &sample_dir.join("uce_recruit_contig_probe_gate.tsv"),
         &evidence,
     )?;
-    for field in ["auto_recruit_probe_gate", "auto_recruit_probe_gate_reason"] {
+    for field in [
+        "auto_recruit_probe_gate",
+        "auto_recruit_probe_gate_reason",
+        "auto_recruit_core_anchor_status",
+        "auto_recruit_core_structural_review",
+        "auto_recruit_core_long_inverted_repeat",
+        "auto_recruit_core_maximum_unsupported_internal_gap",
+    ] {
         if !summary.headers.iter().any(|header| header == field) {
             summary.headers.push(field.to_owned());
         }
     }
-    let mut accepted = 0_usize;
-    let mut rejected = 0_usize;
+    let mut anchored = 0_usize;
+    let mut review = 0_usize;
+    let mut probe_rejected = 0_usize;
+    let mut structure_rejected = 0_usize;
+    let mut assembler_rejected = 0_usize;
     for row in &evidence {
         let summary_row = summary.rows.get_mut(&row.locus).ok_or_else(|| {
             format!(
-                "UCE fallback probe gate has no assembly summary row for '{}'",
+                "UCE provisional core gate has no assembly summary row for '{}'",
                 row.locus
             )
         })?;
+        let was_assembler_accepted = uce_row_accepted(Some(summary_row));
         summary_row.insert(
             "auto_recruit_probe_gate".into(),
             if row.accepted { "pass" } else { "reject" }.into(),
         );
         summary_row.insert("auto_recruit_probe_gate_reason".into(), row.reason.into());
+        summary_row.insert(
+            "auto_recruit_core_anchor_status".into(),
+            row.core_anchor_status.into(),
+        );
+        summary_row.insert(
+            "auto_recruit_core_structural_review".into(),
+            row.structural_review.into(),
+        );
+        summary_row.insert(
+            "auto_recruit_core_long_inverted_repeat".into(),
+            u8::from(row.long_inverted_repeat).to_string(),
+        );
+        summary_row.insert(
+            "auto_recruit_core_maximum_unsupported_internal_gap".into(),
+            row.maximum_unsupported_internal_gap.to_string(),
+        );
         if row.accepted {
-            accepted += 1;
+            anchored += 1;
+            review += usize::from(row.core_anchor_status == "anchored_with_review");
             continue;
         }
-        rejected += 1;
+        match row.core_anchor_status {
+            "structure_rejected" => structure_rejected += 1,
+            "probe_rejected" => probe_rejected += 1,
+            _ => assembler_rejected += 1,
+        }
+        if !was_assembler_accepted {
+            continue;
+        }
         summary_row.insert("accepted".into(), "0".into());
         summary_row.insert("low_quality".into(), "1".into());
-        summary_row.insert("status".into(), "fallback_probe_gate_rejected".into());
+        summary_row.insert("status".into(), "fallback_core_gate_rejected".into());
         archive_fallback_probe_rejected(sample_dir, &row.locus)?;
     }
     write_uce_summary(&sample_dir.join("uce_assembly_summary.csv"), &summary)?;
     write_result_dict_from_uce_summary(sample_dir, &summary)?;
     eprintln!(
-        "UCE auto fallback contig probe gate: {} accepted, {} rejected, {} recruited loci had no accepted contig; {} worker(s), {:.3}s probe evaluation",
-        accepted,
-        rejected,
-        fallback_loci.len().saturating_sub(evidence.len()),
+        "UCE auto provisional core gate: {} anchored ({} internal-gap review), {} probe rejected, {} structure rejected, {} assembler rejected or missing; {} worker(s), {:.3}s probe evaluation",
+        anchored,
+        review,
+        probe_rejected,
+        structure_rejected,
+        assembler_rejected,
         gate_workers,
         evaluation_seconds,
     );
@@ -6722,16 +6766,19 @@ Minimum local alignment overlap for a fallback read pair (default: 45 bp).\n  \
 --uce-fallback-min-alignment-identity FLOAT\n               \
 Minimum local alignment identity for a fallback read pair (default: 0.80).\n               \
 Fallback-only assembled contigs must be at least 200 bp, align to the target\n               \
-probe at >=80% coverage and >=80% identity, and have no near-tied panel locus.\n\n\
+probe at >=80% coverage and >=80% identity, have no near-tied panel locus,\n               \
+and pass the provisional-core inverted-repeat guard before rescue. Internal\n               \
+read-chain gaps >=40 bp are reported for review rather than rejected alone.\n\n\
 UCE rescue:\n  \
---uce-rescue-reads  Enable rescue after the initial UCE assembly.\n  \
+--uce-rescue-reads  Enable rescue after the initial UCE assembly. In auto mode,\n               \
+only anchored provisional cores seed whole-contig and terminal rescue.\n  \
 --uce-rescue-rounds 1|2  Number of rescue rounds (default: 2).\n  \
 --uce-rescue-reverse-reuse-reference-scale FLOAT\n               \
 Scale only the reference bonus when a reverse-complement node is already\n               \
 present in either rescue assembly arm (default: 1.0; range: 0-1; 1 disables).\n  \
 --uce-rescue-inverted-repeat-min-bp INT\n               \
-Roll back a locus when rescue newly introduces an exact long inverted repeat\n               \
-(default: 150 bp; 0 disables).\n\n\
+Reject a provisional fallback core or roll back a rescue round when it contains\n               \
+or newly introduces an exact long inverted repeat (default: 150 bp; 0 disables).\n\n\
 Detected auto budget: {workers} ({source})"
     );
 }
@@ -7013,21 +7060,6 @@ mod tests {
     }
 
     #[test]
-    fn long_inverted_repeat_detector_finds_exact_nonoverlapping_arms() {
-        let arm = test_dna(180, 41);
-        let sequence = format!(
-            "{}{}{}",
-            arm,
-            test_dna(60, 42),
-            reverse_complement_text(&arm)
-        );
-        assert!(has_long_inverted_repeat(&sequence, 150));
-        assert!(!has_long_inverted_repeat(&sequence, 200));
-        assert!(!has_long_inverted_repeat(&test_dna(700, 43), 150));
-        assert!(!has_long_inverted_repeat("NNNNACGTNNNN", 10));
-    }
-
-    #[test]
     fn rescue_guard_only_flags_a_new_long_inverted_repeat() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -7101,6 +7133,29 @@ mod tests {
             .unwrap()
             .contains("AAAAGGGG"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn review_only_provisional_core_is_not_rescue_eligible() {
+        let clean = BTreeMap::from([
+            ("locus".into(), "clean".into()),
+            ("auto_recruit_core_anchor_status".into(), "anchored".into()),
+        ]);
+        let review = BTreeMap::from([
+            ("locus".into(), "review".into()),
+            (
+                "auto_recruit_core_anchor_status".into(),
+                "anchored_with_review".into(),
+            ),
+        ]);
+        let summary = UceSummary {
+            headers: vec!["locus".into(), "auto_recruit_core_anchor_status".into()],
+            rows: BTreeMap::from([("clean".into(), clean), ("review".into(), review)]),
+        };
+        assert_eq!(
+            review_only_provisional_cores(&summary),
+            ["review".to_owned()].into_iter().collect()
+        );
     }
 
     #[test]
@@ -7194,6 +7249,52 @@ mod tests {
             "round one"
         );
         assert!(backup.join("uce_rescue_round_1/evidence.txt").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn initial_uce_recruit_audits_survive_rescue_rebuild() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gm2_recruit_audits_{}_{unique}",
+            std::process::id()
+        ));
+        let sample = root.join("sample");
+        let backup = root.join("backup");
+        fs::create_dir_all(&sample).unwrap();
+        fs::create_dir_all(backup.join("fallback_probe_rejected/results")).unwrap();
+        for name in [
+            "uce_filter_summary.fast.tsv",
+            "uce_filter_summary.fallback.tsv",
+            "uce_recruit_passes.tsv",
+            "uce_recruit_contig_probe_gate.tsv",
+        ] {
+            fs::write(backup.join(name), name).unwrap();
+        }
+        fs::write(
+            backup.join("fallback_probe_rejected/results/uce-1.fasta"),
+            ">uce-1\nACGT\n",
+        )
+        .unwrap();
+
+        restore_initial_uce_recruit_audits(&sample, &backup).unwrap();
+
+        for name in [
+            "uce_filter_summary.fast.tsv",
+            "uce_filter_summary.fallback.tsv",
+            "uce_recruit_passes.tsv",
+            "uce_recruit_contig_probe_gate.tsv",
+        ] {
+            assert_eq!(fs::read_to_string(sample.join(name)).unwrap(), name);
+            assert!(backup.join(name).is_file());
+        }
+        assert_eq!(
+            fs::read_to_string(sample.join("fallback_probe_rejected/results/uce-1.fasta")).unwrap(),
+            ">uce-1\nACGT\n"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
