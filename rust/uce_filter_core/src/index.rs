@@ -243,13 +243,6 @@ impl RecruitIndex {
         }
     }
 
-    fn clear(&mut self) {
-        match self {
-            Self::Short(index) => index.clear(),
-            Self::Long(index) => index.clear(),
-        }
-    }
-
     fn insert_sequence(&mut self, sequence: &[u8], k: usize, locus: LocusId) {
         match self {
             Self::Short(index) => scan_kmers_u64(sequence, k, 1, true, |key, _| {
@@ -308,6 +301,29 @@ impl RecruitIndex {
     }
 }
 
+fn scan_recruit_index(
+    index: &RecruitIndex,
+    bloom: &BlockedBloom,
+    k: usize,
+    sequence: &[u8],
+    step: usize,
+    hits: &mut RecruitScratch,
+    profile: Option<&mut IndexProfile>,
+) {
+    let mut profile = profile;
+    index.scan(sequence, k, step, bloom, |loci, bloom_rejected| {
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.recruit_probes += 1;
+            profile.recruit_bloom_rejected += u64::from(bloom_rejected);
+            profile.recruit_hits += u64::from(loci.is_some());
+        }
+        let Some(loci) = loci else { return };
+        for &locus in loci.values() {
+            hits.insert(locus);
+        }
+    });
+}
+
 #[derive(Clone, Debug)]
 pub struct OrientedReference {
     pub locus: LocusId,
@@ -322,6 +338,8 @@ pub struct UceIndex {
     pub references: Vec<OrientedReference>,
     recruit: RecruitIndex,
     recruit_bloom: BlockedBloom,
+    panel_recruit: Option<RecruitIndex>,
+    panel_recruit_bloom: Option<BlockedBloom>,
     exact: Vec<LocusMemIndex>,
 }
 
@@ -491,6 +509,10 @@ pub fn scan_kmers_u64(
     }
 }
 
+pub fn default_verify_k(recruit_k: usize) -> usize {
+    std::cmp::max(recruit_k / 2, recruit_k.saturating_sub(13)) | 1
+}
+
 impl UceIndex {
     pub fn build(reference: &Path, k: usize) -> Result<Self, String> {
         Self::build_split(reference, reference, k)
@@ -501,17 +523,30 @@ impl UceIndex {
         verify_reference: &Path,
         k: usize,
     ) -> Result<Self, String> {
+        Self::build_split_with_verify_k(recruit_reference, verify_reference, k, default_verify_k(k))
+    }
+
+    pub fn build_split_with_verify_k(
+        recruit_reference: &Path,
+        verify_reference: &Path,
+        k: usize,
+        verify_k: usize,
+    ) -> Result<Self, String> {
         if !(1..=64).contains(&k) {
             return Err("UCEFilter currently supports k-mer sizes 1..=64".to_string());
         }
-        let run_k = std::cmp::max(k / 2, k.saturating_sub(13)) | 1;
+        if !(1..=64).contains(&verify_k) {
+            return Err("UCEFilter currently supports verification k-mer sizes 1..=64".to_string());
+        }
         let mut index = Self {
             k,
-            run_k,
+            run_k: verify_k,
             loci: Vec::new(),
             references: Vec::new(),
             recruit: RecruitIndex::new(k),
             recruit_bloom: BlockedBloom::for_keys(1),
+            panel_recruit: None,
+            panel_recruit_bloom: None,
             exact: Vec::new(),
         };
         for path in reference_paths(verify_reference)? {
@@ -542,7 +577,9 @@ impl UceIndex {
             }
         }
         if recruit_reference != verify_reference {
-            index.recruit.clear();
+            let panel_recruit = std::mem::replace(&mut index.recruit, RecruitIndex::new(k));
+            index.panel_recruit_bloom = Some(panel_recruit.bloom());
+            index.panel_recruit = Some(panel_recruit);
             let locus_by_name: AHashMap<_, _> = index
                 .loci
                 .iter()
@@ -562,7 +599,7 @@ impl UceIndex {
             }
         }
         index.recruit_bloom = index.recruit.bloom();
-        index.exact = build_locus_indexes(&index.references, index.loci.len(), run_k)?;
+        index.exact = build_locus_indexes(&index.references, index.loci.len(), verify_k)?;
         Ok(index)
     }
 
@@ -581,24 +618,32 @@ impl UceIndex {
         hits: &mut RecruitScratch,
         profile: Option<&mut IndexProfile>,
     ) {
-        let mut profile = profile;
-        self.recruit.scan(
-            sequence,
-            self.k,
-            step,
+        scan_recruit_index(
+            &self.recruit,
             &self.recruit_bloom,
-            |loci, bloom_rejected| {
-                if let Some(profile) = profile.as_deref_mut() {
-                    profile.recruit_probes += 1;
-                    profile.recruit_bloom_rejected += u64::from(bloom_rejected);
-                    profile.recruit_hits += u64::from(loci.is_some());
-                }
-                let Some(loci) = loci else { return };
-                for &locus in loci.values() {
-                    hits.insert(locus);
-                }
-            },
+            self.k,
+            sequence,
+            step,
+            hits,
+            profile,
         );
+    }
+
+    pub fn requires_panel_recruitment_expansion(&self) -> bool {
+        self.panel_recruit.is_some()
+    }
+
+    pub fn expand_recruitment_to_panel(
+        &self,
+        sequence: &[u8],
+        step: usize,
+        hits: &mut RecruitScratch,
+        profile: Option<&mut IndexProfile>,
+    ) {
+        let (Some(recruit), Some(bloom)) = (&self.panel_recruit, &self.panel_recruit_bloom) else {
+            return;
+        };
+        scan_recruit_index(recruit, bloom, self.k, sequence, step, hits, profile);
     }
 
     pub fn orientation_events(&self, sequence: &[u8], candidates: &[LocusId]) -> Vec<Vec<u8>> {
@@ -738,6 +783,28 @@ mod tests {
             })
             .max()
             .unwrap_or(0)
+    }
+
+    #[test]
+    fn recruitment_and_verification_kmers_are_independent() {
+        let root = std::env::temp_dir().join(format!(
+            "uce-filter-independent-k-{}-{}",
+            std::process::id(),
+            NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let reference = b"ACGTTGCAACGATTCGGTACCATGCAAGTTCG";
+        let mut out = fs::File::create(root.join("locus.fa")).unwrap();
+        writeln!(out, ">ref").unwrap();
+        out.write_all(reference).unwrap();
+        writeln!(out).unwrap();
+        drop(out);
+        let sensitive = UceIndex::build_split_with_verify_k(&root, &root, 21, 19).unwrap();
+        assert_eq!(sensitive.k, 21);
+        assert_eq!(sensitive.run_k, 19);
+        assert_eq!(default_verify_k(21), 11);
+        assert_eq!(default_verify_k(31), 19);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

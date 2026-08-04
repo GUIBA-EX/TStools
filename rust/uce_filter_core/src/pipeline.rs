@@ -1,9 +1,12 @@
 use crate::alignment::{align_read, terminal_evidence};
 use crate::evidence::{collect_runs_stats, infer_orientation};
-use crate::index::{ExactSeed, IndexProfile, ReadEvidenceScratch, RecruitScratch, UceIndex};
+use crate::index::{
+    default_verify_k, ExactSeed, IndexProfile, ReadEvidenceScratch, RecruitScratch, UceIndex,
+};
 use crate::model::{default_spill_path, Candidate, Fragment, FragmentBank, LocusId};
 use crate::selection::{choose_auto, choose_legacy, selected};
 use gm2_tools::fastx::{gzip_backend_name, open_input, FastxRecord};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -19,7 +22,12 @@ pub struct Config {
     pub read2: PathBuf,
     pub output: PathBuf,
     pub kmer_size: usize,
+    pub verify_kmer_size: Option<usize>,
     pub step: usize,
+    pub max_locus_count: usize,
+    pub retain_loci_file: Option<PathBuf>,
+    pub minimum_alignment_overlap: usize,
+    pub minimum_alignment_identity: f64,
     pub min_depth: i64,
     pub max_depth: i64,
     pub max_size_mb: i64,
@@ -63,6 +71,63 @@ pub struct RunSummary {
 const LOCUS_BUFFER_BYTES: usize = 64 * 1024;
 const DECODE_CHUNK_BYTES: usize = 1024 * 1024;
 const DECODE_BUFFERS_PER_MATE: usize = 2;
+
+fn passes_alignment_filter(
+    index: &UceIndex,
+    locus: LocusId,
+    read1: &[u8],
+    read2: &[u8],
+    band: usize,
+    minimum_overlap: usize,
+    minimum_identity: f64,
+) -> bool {
+    if minimum_overlap == 0 && minimum_identity == 0.0 {
+        return true;
+    }
+    [read1, read2].into_iter().any(|read| {
+        align_read(index, read, locus, band).is_some_and(|alignment| {
+            alignment.reference_overlap() >= minimum_overlap
+                && alignment.identity() >= minimum_identity
+        })
+    })
+}
+
+fn retain_locus_mask(path: &Path, index: &UceIndex) -> Result<Vec<bool>, String> {
+    let requested = fs::read_to_string(path)
+        .map_err(|error| {
+            format!(
+                "Unable to read retain-loci file '{}': {error}",
+                path.display()
+            )
+        })?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let known = index
+        .loci
+        .iter()
+        .enumerate()
+        .map(|(id, locus)| (locus.name.as_str(), id))
+        .collect::<BTreeMap<_, _>>();
+    let unknown = requested
+        .iter()
+        .filter(|name| !known.contains_key(name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "retain-loci file contains unknown loci: {}",
+            unknown.join(", ")
+        ));
+    }
+    let mut mask = vec![false; index.loci.len()];
+    for name in requested {
+        mask[known[name.as_str()]] = true;
+    }
+    Ok(mask)
+}
 
 struct LocusOutput {
     path: PathBuf,
@@ -728,18 +793,39 @@ fn add_exact_evidence(
     }
 }
 
+fn constrain_evidence(
+    evidence: &mut Vec<(LocusId, FastEvidence)>,
+    max_locus_count: usize,
+    retain_loci: Option<&[bool]>,
+) {
+    if max_locus_count > 0 && evidence.len() > max_locus_count {
+        evidence.clear();
+    } else if let Some(retain_loci) = retain_loci {
+        evidence.retain(|(locus, _)| retain_loci[*locus as usize]);
+    }
+}
+
 pub fn run(config: &Config) -> Result<RunSummary, String> {
     let started = Instant::now();
     let index_started = Instant::now();
-    let index = UceIndex::build_split(
+    let verify_k = config
+        .verify_kmer_size
+        .unwrap_or_else(|| default_verify_k(config.kmer_size));
+    let index = UceIndex::build_split_with_verify_k(
         config
             .recruit_references
             .as_deref()
             .unwrap_or(&config.references),
         &config.references,
         config.kmer_size,
+        verify_k,
     )?;
     let index_seconds = index_started.elapsed().as_secs_f64();
+    let retain_loci = config
+        .retain_loci_file
+        .as_deref()
+        .map(|path| retain_locus_mask(path, &index))
+        .transpose()?;
     eprintln!(
         "UCEFilter index: {} loci, {} FM-index symbols, k={}, run-k={} ({:.3}s)",
         index.loci.len(),
@@ -748,6 +834,9 @@ pub fn run(config: &Config) -> Result<RunSummary, String> {
         index.run_k,
         index_seconds
     );
+    if index.requires_panel_recruitment_expansion() {
+        eprintln!("UCEFilter recruitment: subset gate with full-panel candidate expansion");
+    }
     eprintln!("UCEFilter gzip backend: {}", gzip_backend_name());
     if config.profile {
         eprintln!(
@@ -822,16 +911,35 @@ pub fn run(config: &Config) -> Result<RunSummary, String> {
             config.profile.then_some(&mut index_profile),
         );
         recruited_loci.sort();
+        if recruited_loci.loci().is_empty() {
+            if let Some(started) = stage_started {
+                recruit_seconds += started.elapsed().as_secs_f64();
+            }
+            ordinal += 1;
+            continue;
+        }
+        if index.requires_panel_recruitment_expansion() {
+            recruited_loci.begin(index.loci.len());
+            index.expand_recruitment_to_panel(
+                &r1.sequence,
+                config.step,
+                &mut recruited_loci,
+                config.profile.then_some(&mut index_profile),
+            );
+            index.expand_recruitment_to_panel(
+                &r2.sequence,
+                config.step,
+                &mut recruited_loci,
+                config.profile.then_some(&mut index_profile),
+            );
+            recruited_loci.sort();
+        }
         let loci = recruited_loci.loci();
         for &locus in loci {
             coarse_counts[locus as usize] += 2;
         }
         if let Some(started) = stage_started {
             recruit_seconds += started.elapsed().as_secs_f64();
-        }
-        if loci.is_empty() {
-            ordinal += 1;
-            continue;
         }
         let stage_started = config.profile.then(Instant::now);
         index.read_evidence(
@@ -860,6 +968,17 @@ pub fn run(config: &Config) -> Result<RunSummary, String> {
             if !keep_linked_pair(mate1.orientation, orient2) {
                 continue;
             }
+            if !passes_alignment_filter(
+                &index,
+                locus,
+                &r1.sequence,
+                &r2.sequence,
+                config.shadow_band,
+                config.minimum_alignment_overlap,
+                config.minimum_alignment_identity,
+            ) {
+                continue;
+            }
             let mut fast = FastEvidence::default();
             if let Some(seed) = mate1.best {
                 add_exact_evidence(
@@ -881,6 +1000,11 @@ pub fn run(config: &Config) -> Result<RunSummary, String> {
             }
             evidence.push((locus, fast));
         }
+        constrain_evidence(
+            &mut evidence,
+            config.max_locus_count,
+            retain_loci.as_deref(),
+        );
         if let Some(started) = stage_started {
             evidence_seconds += started.elapsed().as_secs_f64();
         }
@@ -1145,11 +1269,11 @@ pub fn output_exists(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_exact_evidence, evenly_sample, keep_linked_pair, next_pair_into, paired_read_id,
-        BackgroundReader, FastEvidence, FastqScratchReader, FragmentRoutes, LocusCandidateStore,
-        DECODE_CHUNK_BYTES,
+        add_exact_evidence, constrain_evidence, evenly_sample, keep_linked_pair, next_pair_into,
+        paired_read_id, run, BackgroundReader, Config, FastEvidence, FastqScratchReader,
+        FragmentRoutes, LocusCandidateStore, DECODE_CHUNK_BYTES,
     };
-    use crate::index::UceIndex;
+    use crate::index::{reverse_complement, UceIndex};
     use crate::model::Candidate;
     use gm2_tools::fastx::FastxRecord;
     use std::fs;
@@ -1165,6 +1289,173 @@ mod tests {
         assert!(keep_linked_pair(1, 2));
         assert!(keep_linked_pair(3, 0));
         assert!(keep_linked_pair(3, 3));
+    }
+
+    #[test]
+    fn panel_ambiguity_is_rejected_before_the_retain_locus_gate() {
+        let mut evidence = vec![(0, FastEvidence::default()), (1, FastEvidence::default())];
+        constrain_evidence(&mut evidence, 1, Some(&[true, false]));
+        assert!(evidence.is_empty());
+
+        let mut evidence = vec![(0, FastEvidence::default())];
+        constrain_evidence(&mut evidence, 1, Some(&[true, false]));
+        assert_eq!(evidence.len(), 1);
+
+        let mut evidence = vec![(1, FastEvidence::default())];
+        constrain_evidence(&mut evidence, 1, Some(&[true, false]));
+        assert!(evidence.is_empty());
+    }
+
+    #[test]
+    fn subset_recruitment_expands_to_the_panel_before_ambiguity_rejection() {
+        let root = std::env::temp_dir().join(format!(
+            "uce-filter-subset-panel-ambiguity-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let references = root.join("references");
+        let recruit_references = root.join("recruit-references");
+        fs::create_dir_all(&references).unwrap();
+        fs::create_dir_all(&recruit_references).unwrap();
+        let reference =
+            b"ACGTTGCAACGATTCGGTACCATGCAAGTTCGATCGGATCCGTAACCGGTTAGCTACGATGCTAGGCTTACCGAT";
+        let fasta = format!(">ref\n{}\n", String::from_utf8_lossy(reference));
+        fs::write(references.join("target.fa"), &fasta).unwrap();
+        fs::write(references.join("other.fa"), &fasta).unwrap();
+        fs::write(recruit_references.join("target.fa"), &fasta).unwrap();
+        let r1 = &reference[..25];
+        let r2 = reverse_complement(&reference[35..60]);
+        let fastq = |mate: usize, sequence: &[u8]| {
+            format!(
+                "@pair/{}\n{}\n+\n{}\n",
+                mate,
+                String::from_utf8_lossy(sequence),
+                "I".repeat(sequence.len())
+            )
+        };
+        let read1 = root.join("r1.fq");
+        let read2 = root.join("r2.fq");
+        fs::write(&read1, fastq(1, r1)).unwrap();
+        fs::write(&read2, fastq(2, &r2)).unwrap();
+        let retain = root.join("retain.txt");
+        fs::write(&retain, "target\n").unwrap();
+        let output = root.join("output");
+        let summary = run(&Config {
+            references,
+            recruit_references: Some(recruit_references),
+            read1,
+            read2,
+            output: output.clone(),
+            kmer_size: 21,
+            verify_kmer_size: Some(19),
+            step: 1,
+            max_locus_count: 1,
+            retain_loci_file: Some(retain),
+            minimum_alignment_overlap: 0,
+            minimum_alignment_identity: 0.0,
+            min_depth: 50,
+            max_depth: 768,
+            max_size_mb: 6,
+            max_fragments: 0,
+            memory_limit_mib: 16,
+            selection_auto: true,
+            reference_is_contig: false,
+            alignment_shadow: false,
+            shadow_per_locus: 64,
+            shadow_band: 32,
+            terminal_window: 150,
+            profile: false,
+        })
+        .unwrap();
+        assert_eq!(summary.loci_written, 0);
+        assert!(!output.join("filtered/target.fq").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sensitive_pass_recovers_a_pair_that_fast_k31_cannot_recruit() {
+        let root =
+            std::env::temp_dir().join(format!("uce-filter-sensitive-pass-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let references = root.join("references");
+        fs::create_dir_all(&references).unwrap();
+        let reference =
+            b"ACGTTGCAACGATTCGGTACCATGCAAGTTCGATCGGATCCGTAACCGGTTAGCTACGATGCTAGGCTTACCGAT";
+        fs::write(
+            references.join("locus.fa"),
+            format!(">ref\n{}\n", String::from_utf8_lossy(reference)),
+        )
+        .unwrap();
+        let r1 = &reference[..25];
+        let r2 = reverse_complement(&reference[35..60]);
+        let fastq = |mate: usize, sequence: &[u8]| {
+            format!(
+                "@pair/{}\n{}\n+\n{}\n",
+                mate,
+                String::from_utf8_lossy(sequence),
+                "I".repeat(sequence.len())
+            )
+        };
+        let read1 = root.join("r1.fq");
+        let read2 = root.join("r2.fq");
+        fs::write(&read1, fastq(1, r1)).unwrap();
+        fs::write(&read2, fastq(2, &r2)).unwrap();
+        let mut config = Config {
+            references: references.clone(),
+            recruit_references: None,
+            read1,
+            read2,
+            output: root.join("fast"),
+            kmer_size: 31,
+            verify_kmer_size: None,
+            step: 4,
+            max_locus_count: 0,
+            retain_loci_file: None,
+            minimum_alignment_overlap: 0,
+            minimum_alignment_identity: 0.0,
+            min_depth: 50,
+            max_depth: 768,
+            max_size_mb: 6,
+            max_fragments: 0,
+            memory_limit_mib: 16,
+            selection_auto: true,
+            reference_is_contig: false,
+            alignment_shadow: false,
+            shadow_per_locus: 64,
+            shadow_band: 32,
+            terminal_window: 150,
+            profile: false,
+        };
+        let fast = run(&config).unwrap();
+        assert_eq!(fast.loci_written, 0);
+        assert!(!config.output.join("filtered/locus.fq").exists());
+
+        let retain = root.join("retain.txt");
+        fs::write(&retain, "locus\n").unwrap();
+        let recruit_references = root.join("recruit-references");
+        fs::create_dir_all(&recruit_references).unwrap();
+        fs::copy(
+            references.join("locus.fa"),
+            recruit_references.join("locus.fa"),
+        )
+        .unwrap();
+        config.output = root.join("sensitive");
+        config.recruit_references = Some(recruit_references);
+        config.kmer_size = 21;
+        config.verify_kmer_size = Some(19);
+        config.step = 1;
+        config.max_locus_count = 1;
+        config.retain_loci_file = Some(retain);
+        let sensitive = run(&config).unwrap();
+        assert_eq!(sensitive.loci_written, 1);
+        assert!(config.output.join("filtered/locus.fq").is_file());
+
+        config.output = root.join("alignment-filtered");
+        config.minimum_alignment_overlap = 26;
+        let alignment_filtered = run(&config).unwrap();
+        assert_eq!(alignment_filtered.loci_written, 0);
+        assert!(!config.output.join("filtered/locus.fq").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

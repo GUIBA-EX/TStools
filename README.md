@@ -54,6 +54,18 @@ cli/geneminer2 filter assemble \
 
 首先查看 `uce_out/uce_assembly_summary.csv` 和 `uce_out/uce_contigs/`。`--uce-rescue-reads` 是可选的、最多两轮的受证据约束延伸；它不会用参考序列虚构缺口。
 
+若完整跨物种参考侧翼使默认 k=31 招募漏掉部分 UCE，可显式启用保守的自动敏感招募：
+
+```bash
+cli/geneminer2 filter assemble \
+  -f samples.tsv -r uce_references -o uce_out -p auto \
+  --assembly-mode uce --uce-recruit-mode auto
+```
+
+`auto` 先执行与默认行为相同的快速招募，只对快速阶段没有选中 fragments 的 locus 再扫描一次 FASTQ（默认 k=21、step=1、独立验证 k=19）。敏感阶段先用未恢复 locus 子集作粗招募门控；只对命中该子集的 fragments 用完整 probe 面板扩展候选并检查多 locus 歧义，再要求 read pair 至少一端与目标 probe/reference 的局部比对达到 45 bp、80% identity，最后只合并唯一支持某个未恢复 locus 的 reads；随后只组装一次。仅由敏感阶段恢复的 contig 还必须达到 200 bp，并与目标 probe 达到至少 80% coverage、80% identity，且不能存在得分接近的其他 probe locus。该策略扩大的是候选 reads 招募范围，不代表候选位点已经被证明正确。默认模式仍为 `fast`，因此现有命令、速度和结果不变。
+
+自动敏感招募会保留 `uce_filter_summary.fast.tsv`；实际发生第二阶段时还会生成 `uce_filter_summary.fallback.tsv`。`uce_recruit_passes.tsv` 逐 locus 记录快速阶段、敏感阶段和最终来源，`uce_recruit_contig_probe_gate.tsv` 记录敏感阶段 contig 的最终检查证据；被拒绝的结果移入 `fallback_probe_rejected/`，不会静默删除。
+
 ## 选择命令
 
 | 目标 | 命令 | 主要结果 |

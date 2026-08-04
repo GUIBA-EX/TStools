@@ -54,6 +54,18 @@ cli/geneminer2 filter assemble \
 
 Start with `uce_out/uce_assembly_summary.csv` and `uce_out/uce_contigs/`. `--uce-rescue-reads` is an optional, evidence-constrained extension of at most two rounds; it never reference-fills a gap.
 
+If divergent reference flanks cause the default k=31 pass to miss some UCEs, enable the conservative sensitive pass explicitly:
+
+```bash
+cli/geneminer2 filter assemble \
+  -f samples.tsv -r uce_references -o uce_out -p auto \
+  --assembly-mode uce --uce-recruit-mode auto
+```
+
+`auto` first runs the unchanged fast pass, then scans the FASTQs again only for loci with no selected fragments (defaults: k=21, step=1, independent verification k=19). The sensitive pass first uses the unresolved-locus subset as a coarse-recruitment gate; only fragments passing that gate have their candidates expanded against the complete probe panel for multi-locus ambiguity checks. It also requires at least one mate to align locally to the target probe/reference over 45 bp at 80% identity, then merges only reads uniquely supporting an unresolved locus, and assembly runs once afterward. Contigs recovered only by the sensitive pass must be at least 200 bp, align to the target probe at no less than 80% coverage and 80% identity, and have no near-tied locus in the probe panel. This broadens candidate-read recruitment and is not proof that a recovered locus is correct. The default remains `fast`, so existing commands, runtime, and results are unchanged.
+
+Auto recruitment preserves `uce_filter_summary.fast.tsv`; when the second pass runs it also writes `uce_filter_summary.fallback.tsv`. `uce_recruit_passes.tsv` records the fast, fallback, and final source for every locus, while `uce_recruit_contig_probe_gate.tsv` records final sensitive-contig evidence. Rejected outputs are archived under `fallback_probe_rejected/` rather than silently deleted.
+
 ## Choose a command
 
 | Goal | Command | Main result |

@@ -3,6 +3,8 @@
 ## Unreleased
 
 - Renamed the public project to TStools (formerly GeneMiner2-UCE). Repository URLs, `cli/geneminer2`, legacy output identifiers, and scholarly citations remain unchanged for compatibility.
+- Decoupled UCE recruitment k from exact-match verification k inside UCEFilter, while leaving the existing component defaults unchanged.
+- Added the opt-in `--uce-recruit-mode auto`: it retries only fast-pass unresolved loci with a sensitive k=21/step=1 coarse-recruitment gate, expands gated fragments against the complete panel before the ambiguity and unresolved-locus output gates, requires fallback reads to provide a 45 bp/80% local alignment, and merges only newly recovered locus FASTQs. Fallback-only contigs must be at least 200 bp, meet 80% target-probe coverage and identity, and have no near-tied panel locus; all pass and rejection evidence is preserved in auditable TSV sidecars and archived outputs. The default remains `fast`.
 
 ## v1.5.9 — UCE scheduling and rescue correctness
 
